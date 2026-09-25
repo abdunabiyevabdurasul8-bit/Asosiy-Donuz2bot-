@@ -1019,14 +1019,24 @@ async def async_main():
     asyncio.create_task(maintenance())
     log.info("Platform started")
 
+    # Render process yopilib ketmasligi uchun
+    await asyncio.Event().wait()
+
+
 def run_async():
     asyncio.run(async_main())
+
 
 if __name__ == "__main__":
     init_db()
     # Start asyncio runtime in main thread and HTTP server in another thread.
     t = threading.Thread(
-        target=lambda: uvicorn.run(api, host="0.0.0.0", port=PORT, log_level="info"),
+        target=lambda: uvicorn.run(
+            api,
+            host="0.0.0.0",
+            port=PORT,
+            log_level="info"
+        ),
         daemon=True
     )
     t.start()
