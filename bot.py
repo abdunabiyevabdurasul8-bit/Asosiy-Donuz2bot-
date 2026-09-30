@@ -1233,57 +1233,232 @@ async def paystars_balance_admin(update, context):
 # ============================================================
 async def aktivsim_countries_handler(update, context):
     q = update.callback_query
-    if not AKTIVSIM_API_KEY:
-        return await q.message.reply_text(
-            "❌ AKTIVSIM_API_KEY yoki DONUZ_API_KEY sozlanmagan."
-        )
 
-    res = await asyncio.to_thread(aktivsim_countries)
-    if not res.get("ok") or not res.get("result"):
-        return await q.message.reply_text(
-            "❌ AktivSim davlatlar ro'yxatini olishda xatolik."
-        )
+    # Telegram callback spinnerini darhol yopamiz.
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
-    c = conn()
-    custom = {
-        row["country_code"]: row["custom_price"]
-        for row in c.execute(
-            "SELECT country_code,custom_price FROM custom_prices"
-        ).fetchall()
-    }
-    c.close()
-
-    rows = []
-    for country in res["result"][:50]:
-        code = country.get("country_code")
-        name = country.get("name", code)
-        flag = country.get("flag", "")
-        api_price = float(country.get("price", 0) or 0)
-        final = float(custom.get(code, aktivsim_sale_price(api_price)))
-        rows.append([
-            InlineKeyboardButton(
-                f"{flag} {name} — {final:,.0f} so'm",
-                callback_data=f"as_country_{code}"
+    try:
+        if not AKTIVSIM_API_KEY:
+            return await q.message.reply_text(
+                "❌ Virtual raqam xizmati sozlanmagan.\n"
+                "Render Environment Variables ichida "
+                "AKTIVSIM_API_KEY yoki DONUZ_API_KEY yo'q."
             )
+
+        # API chaqiruvini alohida thread'da bajaramiz.
+        res = await asyncio.to_thread(aktivsim_countries)
+
+        if not isinstance(res, dict):
+            log.error("AktivSim getCountries noto'g'ri javob: %r", res)
+            return await q.message.reply_text(
+                "❌ AktivSim API noto'g'ri javob qaytardi."
+            )
+
+        if not res.get("ok"):
+            err = res.get("error") or res.get("message") or "Noma'lum API xatosi"
+            log.error("AktivSim getCountries xatosi: %s | response=%r", err, res)
+            return await q.message.reply_text(
+                f"❌ AktivSim xatosi:\n{str(err)[:500]}"
+            )
+
+        result = res.get("result")
+
+        # Ba'zi API javoblarida ro'yxat result ichida, ayrimlarida
+        # countries/data ichida kelishi mumkin.
+        if isinstance(result, dict):
+            result = (
+                result.get("countries")
+                or result.get("data")
+                or result.get("items")
+                or []
+            )
+
+        if not isinstance(result, list) or not result:
+            log.error("AktivSim davlatlar ro'yxati bo'sh: %r", res)
+            return await q.message.reply_text(
+                "❌ Hozircha davlatlar ro'yxati olinmadi.\n"
+                "AktivSim API javobini tekshiring."
+            )
+
+        c = conn()
+        try:
+            custom = {
+                str(row["country_code"]): row["custom_price"]
+                for row in c.execute(
+                    "SELECT country_code,custom_price FROM custom_prices"
+                ).fetchall()
+            }
+        finally:
+            c.close()
+
+        rows = []
+        for country in result[:50]:
+            if not isinstance(country, dict):
+                continue
+
+            code = country.get("country_code") or country.get("code")
+            if not code:
+                continue
+
+            name = country.get("name") or country.get("country_name") or str(code)
+            flag = country.get("flag") or ""
+            api_price = float(country.get("price", 0) or 0)
+
+            final = float(
+                custom.get(str(code), aktivsim_sale_price(api_price))
+            )
+
+            rows.append([
+                InlineKeyboardButton(
+                    f"{flag} {name} — {final:,.0f} so'm",
+                    callback_data=f"as_country_{code}"
+                )
+            ])
+
+        if not rows:
+            return await q.message.reply_text(
+                "❌ AktivSim davlatlari topilmadi."
+            )
+
+        rows.append([
+            InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")
         ])
 
-    rows.append([
-        InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")
-    ])
-    await q.message.reply_text(
-        "🌍 <b>Virtual raqam</b>\n\nDavlatni tanlang:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(rows)
-    )
+        await q.message.reply_text(
+            "🌍 <b>Virtual raqam</b>\n\nDavlatni tanlang:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+
+    except Exception as e:
+        log.exception("Virtual raqam davlatlar menyusi xatosi")
+        try:
+            await q.message.reply_text(
+                "❌ Virtual raqamni ochishda xatolik yuz berdi.\n"
+                f"Xato: {str(e)[:500]}"
+            )
+        except Exception:
+            pass
 
 
 async def aktivsim_country_handler(update, context):
     q = update.callback_query
     uid = q.from_user.id
-    code = q.data[len("as_country_"):]
-    res = await asyncio.to_thread(aktivsim_countries)
-    if not res.get("ok") or not res.get("result"):
-        return await q.message.reply_text("❌ AktivSim API xatosi.")
+
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    try:
+        code = q.data[len("as_country_"):]
+        res = await asyncio.to_thread(aktivsim_countries)
+
+        if not isinstance(res, dict) or not res.get("ok"):
+            err = res.get("error") if isinstance(res, dict) else "Noma'lum API xatosi"
+            log.error("AktivSim country xatosi: %r", res)
+            return await q.message.reply_text(
+                f"❌ AktivSim API xatosi:\n{str(err)[:500]}"
+            )
+
+        result = res.get("result")
+        if isinstance(result, dict):
+            result = (
+                result.get("countries")
+                or result.get("data")
+                or result.get("items")
+                or []
+            )
+
+        if not isinstance(result, list):
+            return await q.message.reply_text("❌ Davlatlar ro'yxati noto'g'ri.")
+
+        country = next(
+            (
+                x for x in result
+                if isinstance(x, dict)
+                and str(x.get("country_code") or x.get("code")) == str(code)
+            ),
+            None
+        )
+        if not country:
+            return await q.message.reply_text("❌ Davlat topilmadi.")
+
+        c = conn()
+        try:
+            r = c.execute(
+                "SELECT custom_price FROM custom_prices WHERE country_code=?",
+                (code,)
+            ).fetchone()
+        finally:
+            c.close()
+
+        api_price = float(country.get("price", 0) or 0)
+        price = float(r["custom_price"]) if r else aktivsim_sale_price(api_price)
+
+        if get_balance(uid) < Decimal(str(price)):
+            return await q.message.reply_text(
+                f"❌ Balansingiz yetarli emas.\n"
+                f"Kerak: {price:,.0f} so'm\n"
+                f"Balans: {float(get_balance(uid)):,.0f} so'm"
+            )
+
+        await q.message.edit_text("⏳ Raqam olinmoqda, kuting...")
+        bought = await asyncio.to_thread(aktivsim_buy, code)
+
+        if not isinstance(bought, dict) or not bought.get("ok") or not bought.get("result"):
+            err = bought.get("error") if isinstance(bought, dict) else "Noma'lum API xatosi"
+            log.error("AktivSim buyNumber xatosi: %r", bought)
+            return await q.message.edit_text(
+                f"❌ Raqamni olishda xatolik.\n{str(err)[:500]}"
+            )
+
+        result = bought["result"]
+        provider_oid = result.get("order_id", "")
+        phone = result.get("phone", "")
+        api_real_price = result.get("price", api_price)
+
+        add_balance(uid, -price, "purchase", f"AktivSim {code}")
+        save_external_order(
+            uid, "aktivsim", "virtual_number", provider_oid,
+            phone, 1, 0, price, "sold"
+        )
+
+        code_result = await asyncio.to_thread(aktivsim_code, provider_oid)
+        sms_code = ""
+        if isinstance(code_result, dict) and code_result.get("ok") and code_result.get("result"):
+            sms_code = (
+                code_result["result"].get("code")
+                or code_result["result"].get("sms_code")
+                or ""
+            )
+
+        text = (
+            "✅ <b>Raqam muvaffaqiyatli olindi!</b>\n\n"
+            f"🌍 {country.get('name', code)}\n"
+            f"📞 <code>+{phone}</code>\n"
+            f"💰 {price:,.0f} so'm\n"
+            f"🆔 {provider_oid}\n"
+        )
+        if sms_code:
+            text += f"🔑 Kod: <code>{sms_code}</code>\n"
+        else:
+            text += "⏳ SMS kodi hali kelmagan bo'lishi mumkin.\n"
+
+        await q.message.edit_text(text, parse_mode="HTML")
+
+    except Exception as e:
+        log.exception("Virtual raqam sotib olish xatosi")
+        try:
+            await q.message.reply_text(
+                "❌ Virtual raqamda xatolik yuz berdi.\n"
+                f"Xato: {str(e)[:500]}"
+            )
+        except Exception:
+            pass
 
     country = next(
         (x for x in res["result"]
@@ -2498,8 +2673,6 @@ async def game(update, context):
         )
 
     context.user_data.update({
-        "user_id": q.from_user.id,
-
         "game_id": game_id,
         "game_name": game_name,
         "id_label": id_label,
@@ -2671,59 +2844,6 @@ async def offer(update, context):
 
 
 # ============================================================
-# PROMO YORDAMCHI FUNKSIYALAR
-# ============================================================
-
-def get_promo_discount(uid, code, price):
-    """Promo kodni tekshiradi va chegirmani hisoblaydi."""
-    if not code:
-        return Decimal("0")
-
-    code = str(code).strip().upper()
-    price = Decimal(str(price or 0))
-
-    if price <= 0:
-        return Decimal("0")
-
-    c = conn()
-    try:
-        promo = c.execute(
-            """
-            SELECT *
-            FROM promo_codes
-            WHERE code=?
-              AND active=1
-            """,
-            (code,)
-        ).fetchone()
-
-        if not promo:
-            return Decimal("0")
-
-        already_used = c.execute(
-            """
-            SELECT 1
-            FROM promo_users
-            WHERE user_id=?
-              AND code=?
-            """,
-            (uid, code)
-        ).fetchone()
-
-        if already_used:
-            return Decimal("0")
-
-        if promo["max_uses"] > 0 and promo["used"] >= promo["max_uses"]:
-            return Decimal("0")
-
-        percent = Decimal(str(promo["percent"] or 0))
-        discount = price * percent / Decimal("100")
-        return min(price, max(Decimal("0"), discount))
-    finally:
-        c.close()
-
-
-# ============================================================
 # CONFIRM ORDER
 # ============================================================
 
@@ -2745,11 +2865,38 @@ async def confirm_order(
         "promo_code"
     )
 
-    discount = get_promo_discount(
-        message.chat_id,
-        promo,
-        price
-    )
+    discount = Decimal("0")
+
+    if promo:
+
+        c = conn()
+
+        r = c.execute(
+            """
+            SELECT *
+            FROM promo_codes
+            WHERE code=?
+              AND active=1
+            """,
+            (promo,)
+        ).fetchone()
+
+        c.close()
+
+        if r and (
+            r["max_uses"] == 0
+            or r["used"] < r["max_uses"]
+        ):
+
+            discount = (
+                price
+                *
+                Decimal(
+                    str(r["percent"])
+                )
+                /
+                Decimal("100")
+            )
 
     final_price = max(
         Decimal("0"),
@@ -4617,13 +4764,13 @@ async def admin_promo_start(update, context):
 
     context.user_data[
         "admin_state"
-    ] = "promo_name"
+    ] = "promo_admin"
 
     await q.message.reply_text(
-        "🎁 <b>Promo kod yaratish</b>\n\n"
-        "1️⃣ Promo kod nomini yuboring.\n"
-        "Masalan: <code>SALE10</code>",
-        parse_mode="HTML"
+        "🎁 Promo yaratish:\n\n"
+        "KOD FOIZ LIMIT\n\n"
+        "Misol: SALE10 10 100\n"
+        "0 limit = cheksiz"
     )
 
 
@@ -5030,121 +5177,73 @@ async def admin_text_handler(update, context):
     # PROMO ADMIN
     # ========================================================
 
-    if state == "promo_name":
-        code = text.strip().upper()
+    if state == "promo_admin":
 
-        if not code or len(code) > 50 or any(ch.isspace() for ch in code):
+        parts = text.split()
+
+        if len(parts) != 3:
+
             await update.message.reply_text(
-                "❌ Promo nomi noto'g'ri.\n\n"
-                "Masalan: SALE10"
+                "Format: SALE10 10 100"
             )
+
+            return True
+
+        code = parts[0].upper()
+
+        try:
+
+            percent = float(parts[1])
+            limit = int(parts[2])
+
+        except Exception:
+
+            await update.message.reply_text(
+                "❌ Foiz va limit raqam bo'lsin."
+            )
+
+            return True
+
+        if (
+            percent <= 0
+            or percent > 100
+            or limit < 0
+        ):
+
+            await update.message.reply_text(
+                "❌ Qiymatlar noto'g'ri."
+            )
+
             return True
 
         c = conn()
-        exists = c.execute(
-            "SELECT 1 FROM promo_codes WHERE code=?",
-            (code,)
-        ).fetchone()
-        c.close()
 
-        if exists:
-            await update.message.reply_text(
-                "❌ Bu promo kod allaqachon mavjud. Boshqa nom yuboring."
-            )
-            return True
-
-        context.user_data["promo_new_code"] = code
-        context.user_data["admin_state"] = "promo_percent"
-
-        await update.message.reply_text(
-            f"🎁 Promo: <code>{code}</code>\n\n"
-            "2️⃣ Necha foiz chegirma qilasiz?\n"
-            "Masalan: <b>10</b>",
-            parse_mode="HTML"
-        )
-        return True
-
-    if state == "promo_percent":
-        try:
-            percent = float(text.replace(",", ".").strip())
-        except Exception:
-            await update.message.reply_text(
-                "❌ Foizni faqat raqamda yuboring. Masalan: 10"
-            )
-            return True
-
-        if percent <= 0 or percent > 100:
-            await update.message.reply_text(
-                "❌ Foiz 1 dan 100 gacha bo'lishi kerak."
-            )
-            return True
-
-        context.user_data["promo_new_percent"] = percent
-        context.user_data["admin_state"] = "promo_limit"
-
-        await update.message.reply_text(
-            "3️⃣ Promo kod limiti nechta?\n\n"
-            "Masalan: <b>100</b>\n"
-            "♾ Cheksiz bo'lsin desangiz: <b>0</b>",
-            parse_mode="HTML"
-        )
-        return True
-
-    if state == "promo_limit":
-        try:
-            limit = int(text.strip())
-        except Exception:
-            await update.message.reply_text(
-                "❌ Limitni butun raqamda yuboring. Masalan: 100"
-            )
-            return True
-
-        if limit < 0:
-            await update.message.reply_text(
-                "❌ Limit 0 yoki undan katta bo'lishi kerak."
-            )
-            return True
-
-        code = context.user_data.get("promo_new_code", "").upper()
-        percent = float(context.user_data.get("promo_new_percent", 0))
-
-        if not code or percent <= 0:
-            context.user_data.clear()
-            await update.message.reply_text(
-                "❌ Promo ma'lumotlari topilmadi. Qaytadan yarating.",
-                reply_markup=admin_kb()
-            )
-            return True
-
-        c = conn()
         c.execute(
             """
-            INSERT INTO promo_codes
+            INSERT OR REPLACE INTO promo_codes
             (code,percent,max_uses,used,active)
             VALUES (?,?,?,0,1)
-            ON CONFLICT(code) DO UPDATE SET
-                percent=excluded.percent,
-                max_uses=excluded.max_uses,
-                active=1
             """,
-            (code, percent, limit)
+            (
+                code,
+                percent,
+                limit
+            )
         )
+
         c.commit()
         c.close()
 
         context.user_data.clear()
 
-        limit_text = "♾ Cheksiz" if limit == 0 else str(limit)
         await update.message.reply_text(
-            f"✅ <b>Promo yaratildi!</b>\n\n"
-            f"🎁 Kod: <code>{code}</code>\n"
-            f"💸 Chegirma: <b>{percent:g}%</b>\n"
-            f"🔢 Umumiy limit: <b>{limit_text}</b>\n"
-            f"👤 Har bir foydalanuvchi: <b>1 marta</b>\n"
-            f"🎮 Barcha o'yin paketlariga ishlaydi.",
-            parse_mode="HTML",
+            f"✅ Promo yaratildi!\n"
+            f"🎁 {code}\n"
+            f"💸 {percent}%\n"
+            f"🔢 Limit: {limit}",
             reply_markup=admin_kb()
         )
+
         return True
 
     # ========================================================
