@@ -70,7 +70,7 @@ PAYMENT_CARD = os.getenv("PAYMENT_CARD", "").strip()
 # PayStars: Telegram Stars / Premium
 PAYSTARS_API_KEY = os.getenv("PAYSTARS_API_KEY", "").strip()
 PAYSTARS_API = os.getenv("PAYSTARS_API", "https://paystars.uz/api/v1").rstrip("/")
-PAYSTARS_MARKUP_PERCENT = Decimal(os.getenv("PAYSTARS_MARKUP_PERCENT", "4.5"))
+PAYSTARS_MARKUP_PERCENT = Decimal("4.5")  # Qattiq 4.5% ustama; Render ENV ta'sir qilmaydi
 
 # AktivSim / Donuz: virtual raqamlar
 AKTIVSIM_API_KEY = os.getenv("AKTIVSIM_API_KEY", "").strip() or os.getenv("DONUZ_API_KEY", "").strip()
@@ -353,6 +353,12 @@ def init_db():
         ]
         for days, price in plans:
             c.execute("INSERT OR IGNORE INTO subscription_plans(days,price_uzs,active) VALUES (?,?,1)", (days, price))
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS custom_prices(
+                country_code TEXT PRIMARY KEY,
+                custom_price REAL NOT NULL
+            )
+        """)
         c.commit()
         c.close()
 
@@ -1233,232 +1239,57 @@ async def paystars_balance_admin(update, context):
 # ============================================================
 async def aktivsim_countries_handler(update, context):
     q = update.callback_query
-
-    # Telegram callback spinnerini darhol yopamiz.
-    try:
-        await q.answer()
-    except Exception:
-        pass
-
-    try:
-        if not AKTIVSIM_API_KEY:
-            return await q.message.reply_text(
-                "❌ Virtual raqam xizmati sozlanmagan.\n"
-                "Render Environment Variables ichida "
-                "AKTIVSIM_API_KEY yoki DONUZ_API_KEY yo'q."
-            )
-
-        # API chaqiruvini alohida thread'da bajaramiz.
-        res = await asyncio.to_thread(aktivsim_countries)
-
-        if not isinstance(res, dict):
-            log.error("AktivSim getCountries noto'g'ri javob: %r", res)
-            return await q.message.reply_text(
-                "❌ AktivSim API noto'g'ri javob qaytardi."
-            )
-
-        if not res.get("ok"):
-            err = res.get("error") or res.get("message") or "Noma'lum API xatosi"
-            log.error("AktivSim getCountries xatosi: %s | response=%r", err, res)
-            return await q.message.reply_text(
-                f"❌ AktivSim xatosi:\n{str(err)[:500]}"
-            )
-
-        result = res.get("result")
-
-        # Ba'zi API javoblarida ro'yxat result ichida, ayrimlarida
-        # countries/data ichida kelishi mumkin.
-        if isinstance(result, dict):
-            result = (
-                result.get("countries")
-                or result.get("data")
-                or result.get("items")
-                or []
-            )
-
-        if not isinstance(result, list) or not result:
-            log.error("AktivSim davlatlar ro'yxati bo'sh: %r", res)
-            return await q.message.reply_text(
-                "❌ Hozircha davlatlar ro'yxati olinmadi.\n"
-                "AktivSim API javobini tekshiring."
-            )
-
-        c = conn()
-        try:
-            custom = {
-                str(row["country_code"]): row["custom_price"]
-                for row in c.execute(
-                    "SELECT country_code,custom_price FROM custom_prices"
-                ).fetchall()
-            }
-        finally:
-            c.close()
-
-        rows = []
-        for country in result[:50]:
-            if not isinstance(country, dict):
-                continue
-
-            code = country.get("country_code") or country.get("code")
-            if not code:
-                continue
-
-            name = country.get("name") or country.get("country_name") or str(code)
-            flag = country.get("flag") or ""
-            api_price = float(country.get("price", 0) or 0)
-
-            final = float(
-                custom.get(str(code), aktivsim_sale_price(api_price))
-            )
-
-            rows.append([
-                InlineKeyboardButton(
-                    f"{flag} {name} — {final:,.0f} so'm",
-                    callback_data=f"as_country_{code}"
-                )
-            ])
-
-        if not rows:
-            return await q.message.reply_text(
-                "❌ AktivSim davlatlari topilmadi."
-            )
-
-        rows.append([
-            InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")
-        ])
-
-        await q.message.reply_text(
-            "🌍 <b>Virtual raqam</b>\n\nDavlatni tanlang:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(rows)
+    if not AKTIVSIM_API_KEY:
+        return await q.message.reply_text(
+            "❌ AKTIVSIM_API_KEY yoki DONUZ_API_KEY sozlanmagan."
         )
 
-    except Exception as e:
-        log.exception("Virtual raqam davlatlar menyusi xatosi")
-        try:
-            await q.message.reply_text(
-                "❌ Virtual raqamni ochishda xatolik yuz berdi.\n"
-                f"Xato: {str(e)[:500]}"
+    res = await asyncio.to_thread(aktivsim_countries)
+    if not res.get("ok") or not res.get("result"):
+        return await q.message.reply_text(
+            "❌ AktivSim davlatlar ro'yxatini olishda xatolik."
+        )
+
+    c = conn()
+    custom = {
+        row["country_code"]: row["custom_price"]
+        for row in c.execute(
+            "SELECT country_code,custom_price FROM custom_prices"
+        ).fetchall()
+    }
+    c.close()
+
+    rows = []
+    for country in res["result"][:50]:
+        code = country.get("country_code")
+        name = country.get("name", code)
+        flag = country.get("flag", "")
+        api_price = float(country.get("price", 0) or 0)
+        final = float(custom.get(code, aktivsim_sale_price(api_price)))
+        rows.append([
+            InlineKeyboardButton(
+                f"{flag} {name} — {final:,.0f} so'm",
+                callback_data=f"as_country_{code}"
             )
-        except Exception:
-            pass
+        ])
+
+    rows.append([
+        InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")
+    ])
+    await q.message.reply_text(
+        "🌍 <b>Virtual raqam</b>\n\nDavlatni tanlang:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 
 async def aktivsim_country_handler(update, context):
     q = update.callback_query
     uid = q.from_user.id
-
-    try:
-        await q.answer()
-    except Exception:
-        pass
-
-    try:
-        code = q.data[len("as_country_"):]
-        res = await asyncio.to_thread(aktivsim_countries)
-
-        if not isinstance(res, dict) or not res.get("ok"):
-            err = res.get("error") if isinstance(res, dict) else "Noma'lum API xatosi"
-            log.error("AktivSim country xatosi: %r", res)
-            return await q.message.reply_text(
-                f"❌ AktivSim API xatosi:\n{str(err)[:500]}"
-            )
-
-        result = res.get("result")
-        if isinstance(result, dict):
-            result = (
-                result.get("countries")
-                or result.get("data")
-                or result.get("items")
-                or []
-            )
-
-        if not isinstance(result, list):
-            return await q.message.reply_text("❌ Davlatlar ro'yxati noto'g'ri.")
-
-        country = next(
-            (
-                x for x in result
-                if isinstance(x, dict)
-                and str(x.get("country_code") or x.get("code")) == str(code)
-            ),
-            None
-        )
-        if not country:
-            return await q.message.reply_text("❌ Davlat topilmadi.")
-
-        c = conn()
-        try:
-            r = c.execute(
-                "SELECT custom_price FROM custom_prices WHERE country_code=?",
-                (code,)
-            ).fetchone()
-        finally:
-            c.close()
-
-        api_price = float(country.get("price", 0) or 0)
-        price = float(r["custom_price"]) if r else aktivsim_sale_price(api_price)
-
-        if get_balance(uid) < Decimal(str(price)):
-            return await q.message.reply_text(
-                f"❌ Balansingiz yetarli emas.\n"
-                f"Kerak: {price:,.0f} so'm\n"
-                f"Balans: {float(get_balance(uid)):,.0f} so'm"
-            )
-
-        await q.message.edit_text("⏳ Raqam olinmoqda, kuting...")
-        bought = await asyncio.to_thread(aktivsim_buy, code)
-
-        if not isinstance(bought, dict) or not bought.get("ok") or not bought.get("result"):
-            err = bought.get("error") if isinstance(bought, dict) else "Noma'lum API xatosi"
-            log.error("AktivSim buyNumber xatosi: %r", bought)
-            return await q.message.edit_text(
-                f"❌ Raqamni olishda xatolik.\n{str(err)[:500]}"
-            )
-
-        result = bought["result"]
-        provider_oid = result.get("order_id", "")
-        phone = result.get("phone", "")
-        api_real_price = result.get("price", api_price)
-
-        add_balance(uid, -price, "purchase", f"AktivSim {code}")
-        save_external_order(
-            uid, "aktivsim", "virtual_number", provider_oid,
-            phone, 1, 0, price, "sold"
-        )
-
-        code_result = await asyncio.to_thread(aktivsim_code, provider_oid)
-        sms_code = ""
-        if isinstance(code_result, dict) and code_result.get("ok") and code_result.get("result"):
-            sms_code = (
-                code_result["result"].get("code")
-                or code_result["result"].get("sms_code")
-                or ""
-            )
-
-        text = (
-            "✅ <b>Raqam muvaffaqiyatli olindi!</b>\n\n"
-            f"🌍 {country.get('name', code)}\n"
-            f"📞 <code>+{phone}</code>\n"
-            f"💰 {price:,.0f} so'm\n"
-            f"🆔 {provider_oid}\n"
-        )
-        if sms_code:
-            text += f"🔑 Kod: <code>{sms_code}</code>\n"
-        else:
-            text += "⏳ SMS kodi hali kelmagan bo'lishi mumkin.\n"
-
-        await q.message.edit_text(text, parse_mode="HTML")
-
-    except Exception as e:
-        log.exception("Virtual raqam sotib olish xatosi")
-        try:
-            await q.message.reply_text(
-                "❌ Virtual raqamda xatolik yuz berdi.\n"
-                f"Xato: {str(e)[:500]}"
-            )
-        except Exception:
-            pass
+    code = q.data[len("as_country_"):]
+    res = await asyncio.to_thread(aktivsim_countries)
+    if not res.get("ok") or not res.get("result"):
+        return await q.message.reply_text("❌ AktivSim API xatosi.")
 
     country = next(
         (x for x in res["result"]
