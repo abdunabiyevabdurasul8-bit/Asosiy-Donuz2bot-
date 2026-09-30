@@ -1,12 +1,4 @@
 import sqlite3
-import re
-
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-except Exception:
-    psycopg2 = None
-    RealDictCursor = None
 import logging
 import uuid
 import json
@@ -67,29 +59,6 @@ PLAYPAY_BASE = "https://playpay.uz/api/v1"
 # PlayPay Game ID
 PUBG_GAME_ID = 141
 MOBILE_LEGENDS_GAME_ID = 54
-GRAND_MOBILE_GAME_ID = 999
-
-# Grand Mobile nik tekshiruvi (ixtiyoriy)
-# API URL ni Render Environment Variables orqali berish mumkin.
-# Masalan: https://your-api.example/check?player_id={player_id}
-GRAND_MOBILE_NICK_API_URL = os.getenv("GRAND_MOBILE_NICK_API_URL", "").strip()
-GRAND_MOBILE_NICK_API_KEY = os.getenv("GRAND_MOBILE_NICK_API_KEY", "").strip()
-
-GRAND_MOBILE_PACKAGES = [
-    (1, "15 GC", 3000),
-    (2, "30 GC", 5500),
-    (3, "90 GC", 15500),
-    (4, "150 GC", 26000),
-    (5, "200 GC", 34000),
-    (6, "300 GC", 53000),
-    (7, "400 GC", 71500),
-    (8, "500 GC", 85000),
-    (9, "1000 GC", 169000),
-    (10, "1500 GC", 258000),
-    (11, "2000 GC", 345000),
-    (12, "2500 GC", 422000),
-    (13, "3000 GC", 519000),
-]
 
 # 0 = PlayPay API narxining o'zi
 DEFAULT_MARKUP = Decimal("0")
@@ -112,11 +81,7 @@ AKTIVSIM_BASE = os.getenv(
 AKTIVSIM_MARKUP_PERCENT = Decimal(os.getenv("AKTIVSIM_MARKUP_PERCENT", "35"))
 
 # SQLite
-# Database
-# DATABASE_URL berilsa asosiy DB PostgreSQL bo'ladi.
-# DATABASE_URL bo'lmasa eski SQLite ishlaydi.
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DB = os.getenv("DB_PATH", "bot.db").strip() or "bot.db"
+DB = "bot.db"
 MAIN_DB = DB
 CURRENT_DB = contextvars.ContextVar("current_db", default=MAIN_DB)
 CHILD_APPS = {}
@@ -127,109 +92,6 @@ CHILD_DIR = Path("data/child_bots")
 CHILD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-
-class PGRow(dict):
-    """sqlite3.Row ga yaqin dict-like row."""
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            return list(self.values())[key]
-        return super().__getitem__(key)
-
-
-def _pg_sql(sql):
-    """SQLite SQL ni PostgreSQL uchun moslashtiradi."""
-    if not sql:
-        return sql
-    sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
-    # AUTOINCREMENT -> BIGSERIAL
-    sql = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", sql, flags=re.I)
-    # qolgan SQLite PRAGMA lar alohida wrapperda ishlanadi
-    # ? placeholder -> %s
-    out=[]
-    in_single=False
-    i=0
-    while i < len(sql):
-        ch=sql[i]
-        if ch=="'":
-            if in_single and i+1<len(sql) and sql[i+1]=="'":
-                out.append("''"); i+=2; continue
-            in_single=not in_single
-            out.append(ch); i+=1; continue
-        if ch=='?' and not in_single:
-            out.append('%s')
-        else:
-            out.append(ch)
-        i+=1
-    sql=''.join(out)
-    # INSERT OR IGNORE -> ON CONFLICT DO NOTHING
-    if re.match(r"\s*INSERT\s+INTO\s", sql, re.I) and 'ON CONFLICT' not in sql.upper():
-        sql=sql.rstrip().rstrip(';') + ' ON CONFLICT DO NOTHING'
-    return sql
-
-
-def _pg_replace_sql(sql):
-    # INSERT OR REPLACE semantics: PostgreSQL'da barcha insert ustunlarini
-    # conflict bo'lganda EXCLUDED qiymatlariga yangilaymiz.
-    m=re.match(r"\s*INSERT\s+OR\s+REPLACE\s+INTO\s+([\w.]+)\s*\((.*?)\)\s*VALUES\s*\((.*?)\)\s*$", sql.strip().rstrip(';'), re.I|re.S)
-    if not m:
-        return _pg_sql(sql)
-    table=m.group(1); cols=[x.strip().strip('"') for x in m.group(2).split(',')]
-    base=f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({m.group(3)})"
-    updates=', '.join(f'"{c}"=EXCLUDED."{c}"' for c in cols)
-    return base + ' ON CONFLICT DO UPDATE SET ' + updates
-
-
-class PGCursor:
-    def __init__(self, conn, cur):
-        self.conn=conn; self.cur=cur
-    def execute(self, sql, params=None):
-        raw=sql or ''
-        if raw.strip().upper().startswith('PRAGMA TABLE_INFO'):
-            table=raw.split('(',1)[1].split(')',1)[0].strip().strip('"')
-            self.cur.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s ORDER BY ordinal_position", (table,))
-            return self
-        if raw.strip().upper().startswith('PRAGMA '):
-            return self
-        sql2=_pg_replace_sql(raw) if re.search(r'INSERT\s+OR\s+REPLACE', raw, re.I) else _pg_sql(raw)
-        self.cur.execute(sql2, params or ())
-        return self
-    def executemany(self, sql, seq):
-        sql2=_pg_replace_sql(sql) if re.search(r'INSERT\s+OR\s+REPLACE', sql, re.I) else _pg_sql(sql)
-        self.cur.executemany(sql2, seq); return self
-    def fetchone(self):
-        r=self.cur.fetchone(); return PGRow(r) if r else None
-    def fetchall(self):
-        return [PGRow(r) for r in self.cur.fetchall()]
-    def __iter__(self):
-        return iter(self.fetchall())
-
-
-class PGConnection:
-    def __init__(self, url):
-        if psycopg2 is None:
-            raise RuntimeError('PostgreSQL uchun psycopg2-binary kerak.')
-        self.raw=psycopg2.connect(url, connect_timeout=15)
-    def execute(self, sql, params=None):
-        c=self.raw.cursor(cursor_factory=RealDictCursor)
-        return PGCursor(self, c).execute(sql, params)
-    def executescript(self, script):
-        # CREATE TABLE bloklarini ; bo'yicha ajratish yetarli: default qiymatlarda ; yo'q.
-        statements=[x.strip() for x in script.split(';') if x.strip()]
-        for st in statements:
-            self.execute(st)
-        return self
-    def commit(self): self.raw.commit()
-    def rollback(self): self.raw.rollback()
-    def close(self): self.raw.close()
-
-
-def db_connect(path, timeout=30):
-    if path == MAIN_DB and DATABASE_URL:
-        return PGConnection(DATABASE_URL)
-    c=sqlite3.connect(path, timeout=timeout)
-    c.row_factory=sqlite3.Row
-    return c
-
 def active_db():
     return CURRENT_DB.get() or MAIN_DB
 
@@ -238,7 +100,8 @@ def set_active_db_for_bot(bot_id):
     if int(bot_id or 0) == int(MAIN_BOT_ID or 0):
         CURRENT_DB.set(MAIN_DB)
         return MAIN_DB
-    c = main_conn()
+    c = sqlite3.connect(MAIN_DB, timeout=30)
+    c.row_factory = sqlite3.Row
     row = c.execute("SELECT db_path FROM child_bots WHERE bot_id=?", (int(bot_id),)).fetchone()
     c.close()
     path = row["db_path"] if row and row["db_path"] else MAIN_DB
@@ -247,10 +110,10 @@ def set_active_db_for_bot(bot_id):
 
 
 def main_conn():
-    c = db_connect(MAIN_DB, timeout=30)
-    if not DATABASE_URL:
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA foreign_keys=ON")
+    c = sqlite3.connect(MAIN_DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA foreign_keys=ON")
     return c
 
 # Render Web Service porti
@@ -338,13 +201,21 @@ def start_health_server():
 
 def conn():
 
-    c = db_connect(
+    c = sqlite3.connect(
         active_db(),
         timeout=30
     )
-    if not DATABASE_URL or active_db() != MAIN_DB:
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA foreign_keys=ON")
+
+    c.row_factory = sqlite3.Row
+
+    c.execute(
+        "PRAGMA journal_mode=WAL"
+    )
+
+    c.execute(
+        "PRAGMA foreign_keys=ON"
+    )
+
     return c
 
 
@@ -706,7 +577,7 @@ def format_dt(value):
     if not value:
         return "-"
     try:
-        return datetime.fromisoformat(value).strftime("%Y.%m.%d %H:%M:%S")
+        return datetime.fromisoformat(value).strftime("%d.%m.%Y %H:%M")
     except Exception:
         return str(value)
 
@@ -763,7 +634,6 @@ def copy_catalog_to_child(db_path):
     games_rows = src.execute("SELECT * FROM games").fetchall()
     prod_rows = src.execute("SELECT * FROM products").fetchall()
     settings_rows = src.execute("SELECT key,value FROM settings WHERE key IN ('payment_card','channel_id')").fetchall()
-    promo_rows = src.execute("SELECT code,percent,max_uses,used,active FROM promo_codes WHERE active=1").fetchall()
     src.close()
     c = sqlite3.connect(db_path, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
@@ -773,9 +643,6 @@ def copy_catalog_to_child(db_path):
         c.execute("INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", tuple(r[x] for x in ("game_id","paket_id","game_name","package_name","price_usd","api_price_uzs","sale_price","active","updated_at")))
     for r in settings_rows:
         c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (r["key"], r["value"]))
-    for r in promo_rows:
-        c.execute("INSERT OR REPLACE INTO promo_codes(code,percent,max_uses,used,active) VALUES(?,?,?,?,?)",
-                  tuple(r[x] for x in ("code","percent","max_uses","used","active")))
     c.commit(); c.close()
 
 
@@ -811,11 +678,6 @@ async def start_child_bot(bot_id):
     CHILD_APPS[bot_id] = app
     await app.initialize()
     await app.start()
-    await app.bot.set_my_commands([
-        ("start", "Botni boshlash"),
-        ("cancel", "Joriy amalni bekor qilish"),
-        ("admin", "Bot egasi admin paneli"),
-    ])
     if app.updater:
         await app.updater.start_polling(drop_pending_updates=True)
     log.info("Child bot ishga tushdi: @%s (%s)", row["bot_username"], bot_id)
@@ -2046,88 +1908,12 @@ def ensure_mobile_legends():
 
 
 # ============================================================
-# GRAND MOBILE — NIK TEKSHIRUVI
-# ============================================================
-def grand_mobile_check_nickname(player_id):
-    """
-    Grand Mobile ID bo'yicha nikni tekshiradi.
-
-    GRAND_MOBILE_NICK_API_URL berilsa, {player_id} o'rniga ID qo'yib
-    GET so'rov yuboradi. Javobdagi nickname/name/username qiymatlaridan
-    nik olinadi. API mavjud bo'lmasa, manual buyurtma to'xtatilmaydi.
-    """
-    if not GRAND_MOBILE_NICK_API_URL:
-        return {"configured": False, "valid": True, "nickname": ""}
-
-    try:
-        url = GRAND_MOBILE_NICK_API_URL.format(player_id=str(player_id))
-        headers = {}
-        if GRAND_MOBILE_NICK_API_KEY:
-            headers["X-API-Key"] = GRAND_MOBILE_NICK_API_KEY
-            headers["Authorization"] = f"Bearer {GRAND_MOBILE_NICK_API_KEY}"
-        r = requests.get(url, headers=headers, timeout=15)
-        try:
-            data = r.json()
-        except Exception:
-            data = {}
-
-        if not r.ok:
-            return {"configured": True, "valid": False, "nickname": "", "error": f"HTTP {r.status_code}"}
-
-        # Turli API javob formatlarini qo'llab-quvvatlash
-        obj = data.get("data", data) if isinstance(data, dict) else {}
-        nickname = ""
-        if isinstance(obj, dict):
-            nickname = obj.get("nickname") or obj.get("name") or obj.get("username") or obj.get("nick") or ""
-            if isinstance(nickname, dict):
-                nickname = nickname.get("nickname") or nickname.get("name") or ""
-
-        success = data.get("success", data.get("ok", True)) if isinstance(data, dict) else True
-        valid = bool(success) and bool(nickname)
-        return {
-            "configured": True,
-            "valid": valid,
-            "nickname": str(nickname or ""),
-            "raw": data,
-        }
-    except Exception as e:
-        log.warning("Grand Mobile nik tekshiruvi xatosi: %s", e)
-        return {"configured": True, "valid": False, "nickname": "", "error": str(e)}
-
-
-# ============================================================
-# GRAND MOBILE — MANUAL KATALOG
-# ============================================================
-
-def ensure_grand_mobile():
-    # Grand Mobile PlayPay/API ga bog'liq emas.
-    c = conn()
-    now = datetime.now().isoformat()
-    c.execute(
-        """INSERT OR REPLACE INTO games
-        (game_id,name,id_label,requires_server,amount_based,active,updated_at)
-        VALUES (?,?,?,?,?,?,?)""",
-        (GRAND_MOBILE_GAME_ID, "Grand Mobile", "Grand Mobile ID", 0, 0, 1, now),
-    )
-    for paket_id, name, price in GRAND_MOBILE_PACKAGES:
-        c.execute(
-            """INSERT OR REPLACE INTO products
-            (game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (GRAND_MOBILE_GAME_ID, paket_id, "Grand Mobile", name, 0, 0, price, 1, now),
-        )
-    c.commit()
-    c.close()
-
-
-# ============================================================
 # CATALOG SYNC
 # FAQAT ADMIN 🔄 KATALOG ORQALI ISHLAYDI
 # ============================================================
 
 def sync_catalog():
 
-    ensure_grand_mobile()
     game_count = 0
     package_count = 0
     synced_ids = set()
@@ -2143,8 +1929,7 @@ def sync_catalog():
 
         for gid in (
             PUBG_GAME_ID,
-            MOBILE_LEGENDS_GAME_ID,
-            GRAND_MOBILE_GAME_ID
+            MOBILE_LEGENDS_GAME_ID
         ):
 
             data = get_packages_api(
@@ -2200,9 +1985,12 @@ def sync_catalog():
 
                 package_count += 1
 
-        ensure_grand_mobile()
         if not special_ok:
-            return (False, "PlayPay katalogi olinmadi. Grand Mobile manual katalogi saqlandi.")
+
+            return (
+                False,
+                "PlayPay katalogi olinmadi."
+            )
 
         return (
             True,
@@ -2223,8 +2011,6 @@ def sync_catalog():
 
     c.commit()
     c.close()
-
-    ensure_grand_mobile()
 
     # ========================================================
     # PLAYPAY O'YINLARI
@@ -2404,10 +2190,12 @@ def sync_catalog():
             "Mobile Legends 54 sync xatosi"
         )
 
-    ensure_grand_mobile()
-
     if game_count == 0:
-        return (False, "PlayPay katalogi olinmadi. Grand Mobile manual katalogi saqlandi.")
+
+        return (
+            False,
+            "PlayPay katalogi olinmadi."
+        )
 
     return (
         True,
@@ -2568,8 +2356,7 @@ async def games(update, context):
             CASE
                 WHEN game_id=? THEN 0
                 WHEN game_id=? THEN 1
-                WHEN game_id=? THEN 2
-                ELSE 3
+                ELSE 2
             END,
             name
         """,
@@ -2694,11 +2481,6 @@ async def game(update, context):
         id_label = "Player ID"
         requires_server = False
 
-    elif game_id == GRAND_MOBILE_GAME_ID:
-
-        id_label = "Grand Mobile ID"
-        requires_server = False
-
     elif game_id == MOBILE_LEGENDS_GAME_ID:
 
         id_label = "User ID"
@@ -2716,6 +2498,8 @@ async def game(update, context):
         )
 
     context.user_data.update({
+        "user_id": q.from_user.id,
+
         "game_id": game_id,
         "game_name": game_name,
         "id_label": id_label,
@@ -2887,6 +2671,59 @@ async def offer(update, context):
 
 
 # ============================================================
+# PROMO YORDAMCHI FUNKSIYALAR
+# ============================================================
+
+def get_promo_discount(uid, code, price):
+    """Promo kodni tekshiradi va chegirmani hisoblaydi."""
+    if not code:
+        return Decimal("0")
+
+    code = str(code).strip().upper()
+    price = Decimal(str(price or 0))
+
+    if price <= 0:
+        return Decimal("0")
+
+    c = conn()
+    try:
+        promo = c.execute(
+            """
+            SELECT *
+            FROM promo_codes
+            WHERE code=?
+              AND active=1
+            """,
+            (code,)
+        ).fetchone()
+
+        if not promo:
+            return Decimal("0")
+
+        already_used = c.execute(
+            """
+            SELECT 1
+            FROM promo_users
+            WHERE user_id=?
+              AND code=?
+            """,
+            (uid, code)
+        ).fetchone()
+
+        if already_used:
+            return Decimal("0")
+
+        if promo["max_uses"] > 0 and promo["used"] >= promo["max_uses"]:
+            return Decimal("0")
+
+        percent = Decimal(str(promo["percent"] or 0))
+        discount = price * percent / Decimal("100")
+        return min(price, max(Decimal("0"), discount))
+    finally:
+        c.close()
+
+
+# ============================================================
 # CONFIRM ORDER
 # ============================================================
 
@@ -2908,38 +2745,11 @@ async def confirm_order(
         "promo_code"
     )
 
-    discount = Decimal("0")
-
-    if promo:
-
-        c = conn()
-
-        r = c.execute(
-            """
-            SELECT *
-            FROM promo_codes
-            WHERE code=?
-              AND active=1
-            """,
-            (promo,)
-        ).fetchone()
-
-        c.close()
-
-        if r and (
-            r["max_uses"] == 0
-            or r["used"] < r["max_uses"]
-        ):
-
-            discount = (
-                price
-                *
-                Decimal(
-                    str(r["percent"])
-                )
-                /
-                Decimal("100")
-            )
+    discount = get_promo_discount(
+        message.chat_id,
+        promo,
+        price
+    )
 
     final_price = max(
         Decimal("0"),
@@ -3126,87 +2936,6 @@ async def confirm(update, context):
             "❌ Buyurtma ma'lumotlari topilmadi."
         )
 
-        return
-
-    # ========================================================
-    # GRAND MOBILE — MANUAL BUYURTMA (API YO'Q)
-    # ========================================================
-    if int(game_id) == GRAND_MOBILE_GAME_ID:
-        now_s = datetime.now().isoformat()
-        manual_id = "GM-" + uuid.uuid4().hex[:10].upper()
-        promo = context.user_data.get("promo_code", "")
-
-        # ID -> nik tekshiruvi
-        nick_check = await asyncio.to_thread(grand_mobile_check_nickname, player_id)
-        if nick_check.get("configured") and not nick_check.get("valid"):
-            await q.message.reply_text(
-                "❌ Grand Mobile ID tekshirilmadi.\n\n"
-                "ID noto'g'ri yoki o'yinchi topilmadi. Buyurtma yaratilmaydi."
-            )
-            return
-        nickname = nick_check.get("nickname", "")
-
-        c = conn()
-        cur = c.execute(
-            """INSERT INTO orders
-            (user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,
-             cost_usd,charged_usd,sale_price,status,created_at,updated_at,provider,service_type,target,quantity,provider_order_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (uid, manual_id, int(game_id), int(paket_id),
-             context.user_data.get("offer_name","Grand Mobile"), player_id,
-             json.dumps({"player_id": player_id, "nickname": nickname, "promo_code": promo}, ensure_ascii=False),
-             0, 0, float(price), "manual_pending", now_s, now_s,
-             "manual", "grand_mobile", player_id, 1, manual_id)
-        )
-        local_order_id = cur.lastrowid
-        c.commit()
-        c.close()
-
-        add_balance(uid, -price, "purchase", f"Grand Mobile manual buyurtma #{local_order_id}")
-
-        if promo:
-            c = conn()
-            c.execute("INSERT OR IGNORE INTO promo_users(user_id,code) VALUES (?,?)", (uid, promo))
-            c.execute("UPDATE promo_codes SET used=used+1 WHERE code=? AND active=1", (promo,))
-            c.commit()
-            c.close()
-
-        now_display = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
-        await q.message.reply_text(
-            f"✅ Grand Mobile buyurtma qabul qilindi!\n\n"
-            f"🆔 Buyurtma: <code>{manual_id}</code>\n"
-            f"🎮 Grand Mobile ID: <code>{player_id}</code>\n"
-            + (f"👤 Nik: <b>{nickname}</b>\n" if nickname else "")
-            + f"📦 {context.user_data.get('offer_name','Grand Mobile')}\n"
-            f"💰 {price:,.0f} so'm\n"
-            f"📊 Manual: kutilmoqda\n"
-            f"🕐 {now_display}",
-            parse_mode="HTML",
-            reply_markup=main_menu()
-        )
-        try:
-            await context.bot.send_message(
-                bot_admin_id(context),
-                f"🛒 GRAND MOBILE MANUAL BUYURTMA #{local_order_id}\n\n"
-                f"👤 User ID: {uid}\n"
-                f"🆔 Grand Mobile ID: {player_id}\n"
-                + (f"👤 Nik: {nickname}\n" if nickname else "")
-                + f"📦 {context.user_data.get('offer_name','Grand Mobile')}\n"
-                f"💰 Sotuv: {price:,.0f} so'm\n"
-                f"🎁 Promo: {promo or 'yo\'q'}\n"
-                f"📊 KUTILMOQDA\n"
-                f"🕐 {now_display}",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ TUSHDI", callback_data=f"gm_done:{local_order_id}"),
-                        InlineKeyboardButton("❌ BEKOR QILDI", callback_data=f"gm_cancel:{local_order_id}")
-                    ]
-                ])
-            )
-        except Exception as e:
-            log.error("Grand Mobile admin xabari xatosi: %s", e)
-
-        context.user_data.clear()
         return
 
     body = {
@@ -4246,7 +3975,7 @@ async def orders_cb(update, context):
             f"📊 {r['status']}\n"
             f"🔢 PlayPay: "
             f"{r['playpay_order_id']}\n"
-            f"🕐 {format_dt(r['created_at'])}\n\n"
+            f"🕐 {r['created_at']}\n\n"
         )
 
     await q.message.reply_text(
@@ -4661,7 +4390,7 @@ async def admin_payments(update, context):
             f"✅ Tasdiqlangan: "
             f"{r['approved_amount']:,.0f}\n"
             f"📊 {r['status']}\n"
-            f"🕐 {format_dt(r['created_at'])}\n\n"
+            f"🕐 {r['created_at']}\n\n"
         )
 
     await q.message.reply_text(
@@ -4735,7 +4464,7 @@ async def admin_orders(update, context):
             f"📊 {r['status']}\n"
             f"🔢 PlayPay: "
             f"{r['playpay_order_id']}\n"
-            f"🕐 {format_dt(r['created_at'])}\n\n"
+            f"🕐 {r['created_at']}\n\n"
         )
 
     await q.message.reply_text(
@@ -4888,42 +4617,14 @@ async def admin_promo_start(update, context):
 
     context.user_data[
         "admin_state"
-    ] = "promo_admin"
+    ] = "promo_name"
 
     await q.message.reply_text(
-        "🎁 Promo yaratish:\n\n"
-        "KOD FOIZ LIMIT\n\n"
-        "Misol: SALE10 10 100\n"
-        "0 limit = cheksiz"
+        "🎁 <b>Promo kod yaratish</b>\n\n"
+        "1️⃣ Promo kod nomini yuboring.\n"
+        "Masalan: <code>SALE10</code>",
+        parse_mode="HTML"
     )
-
-
-async def admin_promo_list(update, context):
-    q = update.callback_query
-    c = conn()
-    rows = c.execute("SELECT * FROM promo_codes ORDER BY code").fetchall()
-    c.close()
-    if not rows:
-        return await q.message.reply_text("🎁 Promo kodlar yo'q.", reply_markup=admin_kb())
-    text = "🎁 PROMO KODLAR\n\n"
-    kb = []
-    for r in rows:
-        state = "🟢" if r["active"] else "🔴"
-        limit = "cheksiz" if r["max_uses"] == 0 else str(r["max_uses"])
-        text += f"{state} <code>{r['code']}</code> — {r['percent']}% | {r['used']}/{limit}\n"
-        if r["active"]:
-            kb.append([InlineKeyboardButton(f"🗑 O'chirish: {r['code']}", callback_data=f"adm_promo_del:{r['code']}")])
-    kb.append([InlineKeyboardButton("➕ Yangi promo", callback_data="adm_promo_create")])
-    await q.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
-
-async def admin_promo_delete(update, context, code):
-    q = update.callback_query
-    c = conn()
-    c.execute("UPDATE promo_codes SET active=0 WHERE code=?", (code.upper(),))
-    c.commit()
-    c.close()
-    await q.message.reply_text(f"🗑 Promo <code>{code.upper()}</code> o'chirildi.", parse_mode="HTML", reply_markup=admin_kb())
 
 
 async def admin_card_start(update, context):
@@ -5329,73 +5030,121 @@ async def admin_text_handler(update, context):
     # PROMO ADMIN
     # ========================================================
 
-    if state == "promo_admin":
+    if state == "promo_name":
+        code = text.strip().upper()
 
-        parts = text.split()
-
-        if len(parts) != 3:
-
+        if not code or len(code) > 50 or any(ch.isspace() for ch in code):
             await update.message.reply_text(
-                "Format: SALE10 10 100"
+                "❌ Promo nomi noto'g'ri.\n\n"
+                "Masalan: SALE10"
             )
-
-            return True
-
-        code = parts[0].upper()
-
-        try:
-
-            percent = float(parts[1])
-            limit = int(parts[2])
-
-        except Exception:
-
-            await update.message.reply_text(
-                "❌ Foiz va limit raqam bo'lsin."
-            )
-
-            return True
-
-        if (
-            percent <= 0
-            or percent > 100
-            or limit < 0
-        ):
-
-            await update.message.reply_text(
-                "❌ Qiymatlar noto'g'ri."
-            )
-
             return True
 
         c = conn()
+        exists = c.execute(
+            "SELECT 1 FROM promo_codes WHERE code=?",
+            (code,)
+        ).fetchone()
+        c.close()
 
+        if exists:
+            await update.message.reply_text(
+                "❌ Bu promo kod allaqachon mavjud. Boshqa nom yuboring."
+            )
+            return True
+
+        context.user_data["promo_new_code"] = code
+        context.user_data["admin_state"] = "promo_percent"
+
+        await update.message.reply_text(
+            f"🎁 Promo: <code>{code}</code>\n\n"
+            "2️⃣ Necha foiz chegirma qilasiz?\n"
+            "Masalan: <b>10</b>",
+            parse_mode="HTML"
+        )
+        return True
+
+    if state == "promo_percent":
+        try:
+            percent = float(text.replace(",", ".").strip())
+        except Exception:
+            await update.message.reply_text(
+                "❌ Foizni faqat raqamda yuboring. Masalan: 10"
+            )
+            return True
+
+        if percent <= 0 or percent > 100:
+            await update.message.reply_text(
+                "❌ Foiz 1 dan 100 gacha bo'lishi kerak."
+            )
+            return True
+
+        context.user_data["promo_new_percent"] = percent
+        context.user_data["admin_state"] = "promo_limit"
+
+        await update.message.reply_text(
+            "3️⃣ Promo kod limiti nechta?\n\n"
+            "Masalan: <b>100</b>\n"
+            "♾ Cheksiz bo'lsin desangiz: <b>0</b>",
+            parse_mode="HTML"
+        )
+        return True
+
+    if state == "promo_limit":
+        try:
+            limit = int(text.strip())
+        except Exception:
+            await update.message.reply_text(
+                "❌ Limitni butun raqamda yuboring. Masalan: 100"
+            )
+            return True
+
+        if limit < 0:
+            await update.message.reply_text(
+                "❌ Limit 0 yoki undan katta bo'lishi kerak."
+            )
+            return True
+
+        code = context.user_data.get("promo_new_code", "").upper()
+        percent = float(context.user_data.get("promo_new_percent", 0))
+
+        if not code or percent <= 0:
+            context.user_data.clear()
+            await update.message.reply_text(
+                "❌ Promo ma'lumotlari topilmadi. Qaytadan yarating.",
+                reply_markup=admin_kb()
+            )
+            return True
+
+        c = conn()
         c.execute(
             """
-            INSERT OR REPLACE INTO promo_codes
+            INSERT INTO promo_codes
             (code,percent,max_uses,used,active)
             VALUES (?,?,?,0,1)
+            ON CONFLICT(code) DO UPDATE SET
+                percent=excluded.percent,
+                max_uses=excluded.max_uses,
+                active=1
             """,
-            (
-                code,
-                percent,
-                limit
-            )
+            (code, percent, limit)
         )
-
         c.commit()
         c.close()
 
         context.user_data.clear()
 
+        limit_text = "♾ Cheksiz" if limit == 0 else str(limit)
         await update.message.reply_text(
-            f"✅ Promo yaratildi!\n"
-            f"🎁 {code}\n"
-            f"💸 {percent}%\n"
-            f"🔢 Limit: {limit}",
+            f"✅ <b>Promo yaratildi!</b>\n\n"
+            f"🎁 Kod: <code>{code}</code>\n"
+            f"💸 Chegirma: <b>{percent:g}%</b>\n"
+            f"🔢 Umumiy limit: <b>{limit_text}</b>\n"
+            f"👤 Har bir foydalanuvchi: <b>1 marta</b>\n"
+            f"🎮 Barcha o'yin paketlariga ishlaydi.",
+            parse_mode="HTML",
             reply_markup=admin_kb()
         )
-
         return True
 
     # ========================================================
@@ -5769,75 +5518,6 @@ async def rating_callback(update, context):
 
 
 # ============================================================
-# GRAND MOBILE MANUAL ADMIN ACTIONS
-# ============================================================
-async def grand_mobile_admin_action(update, context, order_id, action):
-    q = update.callback_query
-    admin_id = bot_admin_id(context)
-    if q.from_user.id != admin_id:
-        await q.answer("❌ Ruxsat yo'q.", show_alert=True)
-        return
-
-    c = conn()
-    row = c.execute("SELECT * FROM orders WHERE id=? AND game_id=?", (int(order_id), GRAND_MOBILE_GAME_ID)).fetchone()
-    if not row:
-        c.close()
-        return await q.message.reply_text("❌ Manual buyurtma topilmadi.")
-
-    status = row["status"] or ""
-    if status != "manual_pending":
-        c.close()
-        return await q.answer(f"Bu buyurtma allaqachon: {status}", show_alert=True)
-
-    now = datetime.now().isoformat()
-    if action == "done":
-        c.execute("UPDATE orders SET status=?,updated_at=? WHERE id=? AND status='manual_pending'", ("manual_completed", now, int(order_id)))
-        c.commit()
-        changed = c.total_changes
-        c.close()
-        if not changed:
-            return await q.answer("Buyurtma o'zgargan.", show_alert=True)
-
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text(f"✅ #{order_id} buyurtma TUSHDI deb belgilandi.")
-        try:
-            await context.bot.send_message(
-                row["user_id"],
-                f"✅ Grand Mobile buyurtmangiz bajarildi!\n\n"
-                f"🆔 Buyurtma: <code>{row['playpay_order_id']}</code>\n"
-                f"📦 {row['product_name']}\n"
-                f"🎮 ID: <code>{row['player_id']}</code>\n"
-                f"💰 {row['sale_price']:,.0f} so'm",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            log.warning("GM user notification xatosi: %s", e)
-        return
-
-    # Bekor qilish -> pulni qaytarish
-    c.execute("UPDATE orders SET status=?,updated_at=? WHERE id=? AND status='manual_pending'", ("manual_cancelled", now, int(order_id)))
-    c.commit()
-    changed = c.total_changes
-    c.close()
-    if not changed:
-        return await q.answer("Buyurtma o'zgargan.", show_alert=True)
-
-    add_balance(row["user_id"], Decimal(str(row["sale_price"] or 0)), "refund", f"Grand Mobile manual bekor #{order_id}")
-    await q.edit_message_reply_markup(reply_markup=None)
-    await q.message.reply_text(f"❌ #{order_id} bekor qilindi. {row['sale_price']:,.0f} so'm foydalanuvchiga qaytarildi.")
-    try:
-        await context.bot.send_message(
-            row["user_id"],
-            f"❌ Grand Mobile buyurtmangiz bekor qilindi.\n\n"
-            f"🆔 Buyurtma: <code>{row['playpay_order_id']}</code>\n"
-            f"💰 {row['sale_price']:,.0f} so'm balansingizga qaytarildi.",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        log.warning("GM refund notification xatosi: %s", e)
-
-
-# ============================================================
 # ADMIN CALLBACK
 # ============================================================
 
@@ -5849,12 +5529,6 @@ async def admin_callback(update, context):
         return
 
     d = q.data
-
-    if d.startswith("gm_done:"):
-        return await grand_mobile_admin_action(update, context, int(d.split(":", 1)[1]), "done")
-
-    if d.startswith("gm_cancel:"):
-        return await grand_mobile_admin_action(update, context, int(d.split(":", 1)[1]), "cancel")
 
     if d == "adm_addbalance":
 
@@ -5919,13 +5593,11 @@ async def admin_callback(update, context):
         )
 
     elif d == "adm_promo":
-        await admin_promo_list(update, context)
 
-    elif d == "adm_promo_create":
-        await admin_promo_start(update, context)
-
-    elif d.startswith("adm_promo_del:"):
-        await admin_promo_delete(update, context, d.split(":", 1)[1])
+        await admin_promo_start(
+            update,
+            context
+        )
 
     elif d == "adm_card":
 
@@ -6008,9 +5680,6 @@ async def callback_router(update, context):
         pass
 
     d = q.data
-
-    if d.startswith("gm_done:") or d.startswith("gm_cancel:"):
-        return await admin_callback(update, context)
 
     # Qo'shimcha providerlar
     if d == "paystars":
@@ -6335,7 +6004,6 @@ def main():
 
     ensure_pubg()
     ensure_mobile_legends()
-    ensure_grand_mobile()
 
     # --------------------------------------------------------
     # ENV TEKSHIRISH
@@ -6382,19 +6050,6 @@ def main():
     me = rr.json()["result"]
     MAIN_BOT_ID = int(me["id"])
     MAIN_BOT_USERNAME = me.get("username", "")
-
-    try:
-        _requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
-            json={"commands": [
-                {"command": "start", "description": "Botni boshlash"},
-                {"command": "cancel", "description": "Joriy amalni bekor qilish"},
-                {"command": "admin", "description": "Admin panel"},
-            ]},
-            timeout=20,
-        )
-    except Exception:
-        log.exception("Main bot commandlarini o'rnatishda xato")
 
     # Existing child bots are started by the job queue after polling starts.
 
