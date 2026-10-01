@@ -289,10 +289,7 @@ def init_db():
         percent REAL,
         max_uses INTEGER DEFAULT 0,
         used INTEGER DEFAULT 0,
-        active INTEGER DEFAULT 1,
-        duration_minutes INTEGER DEFAULT 0,
-        started_at TEXT DEFAULT '',
-        expires_at TEXT DEFAULT ''
+        active INTEGER DEFAULT 1
     );
 
     CREATE TABLE IF NOT EXISTS promo_users(
@@ -337,18 +334,6 @@ def init_db():
         active INTEGER DEFAULT 1
     );
     """)
-
-    promo_columns = {
-        "duration_minutes": "INTEGER DEFAULT 0",
-        "started_at": "TEXT DEFAULT ''",
-        "expires_at": "TEXT DEFAULT ''",
-    }
-    existing_promo_columns = {
-        r["name"] for r in c.execute("PRAGMA table_info(promo_codes)").fetchall()
-    }
-    for col, typ in promo_columns.items():
-        if col not in existing_promo_columns:
-            c.execute(f"ALTER TABLE promo_codes ADD COLUMN {col} {typ}")
 
     c.commit()
     c.close()
@@ -904,133 +889,6 @@ async def admin_bot_detail(update, context, bot_id):
 
 
 # ============================================================
-# PROMO YORDAMCHI FUNKSIYALAR
-# ============================================================
-
-def promo_row(code):
-    code = str(code or "").strip().upper()
-    if not code:
-        return None
-    c = conn()
-    try:
-        return c.execute(
-            "SELECT * FROM promo_codes WHERE code=? AND active=1",
-            (code,)
-        ).fetchone()
-    finally:
-        c.close()
-
-
-def promo_is_expired(row):
-    if not row:
-        return True
-    expires_at = row["expires_at"] if "expires_at" in row.keys() else ""
-    if not expires_at:
-        return False
-    try:
-        return datetime.now() >= datetime.fromisoformat(expires_at)
-    except Exception:
-        return False
-
-
-def promo_discount_for_user(uid, code, base_price):
-    try:
-        base = Decimal(str(base_price or 0))
-    except Exception:
-        base = Decimal("0")
-    if base <= 0 or not code:
-        return Decimal("0")
-
-    row = promo_row(code)
-    if not row or promo_is_expired(row):
-        return Decimal("0")
-    if row["max_uses"] > 0 and row["used"] >= row["max_uses"]:
-        return Decimal("0")
-
-    c = conn()
-    try:
-        used = c.execute(
-            "SELECT 1 FROM promo_users WHERE user_id=? AND code=?",
-            (uid, str(code).upper())
-        ).fetchone()
-    finally:
-        c.close()
-    if used:
-        return Decimal("0")
-
-    try:
-        percent = Decimal(str(row["percent"] or 0))
-    except Exception:
-        percent = Decimal("0")
-    percent = max(Decimal("0"), min(Decimal("100"), percent))
-    return (base * percent / Decimal("100")).quantize(Decimal("1"))
-
-
-def consume_promo_after_success(uid, code):
-    code = str(code or "").strip().upper()
-    if not code:
-        return False, ""
-
-    c = conn()
-    try:
-        c.execute("BEGIN IMMEDIATE")
-        row = c.execute(
-            "SELECT * FROM promo_codes WHERE code=? AND active=1",
-            (code,)
-        ).fetchone()
-        if not row:
-            c.rollback()
-            return False, "Promo kod topilmadi."
-        if promo_is_expired(row):
-            c.rollback()
-            return False, "Promo kodi muddati tugagan."
-        if row["max_uses"] > 0 and row["used"] >= row["max_uses"]:
-            c.rollback()
-            return False, "Promo kodi limiti tugagan."
-
-        used = c.execute(
-            "SELECT 1 FROM promo_users WHERE user_id=? AND code=?",
-            (uid, code)
-        ).fetchone()
-        if used:
-            c.rollback()
-            return False, "Bu promo koddan oldin foydalangansiz."
-
-        now = datetime.now()
-        started_at = row["started_at"] if "started_at" in row.keys() else ""
-        expires_at = row["expires_at"] if "expires_at" in row.keys() else ""
-        duration = int(row["duration_minutes"] or 0) if "duration_minutes" in row.keys() else 0
-
-        if not started_at and duration > 0:
-            started_at = now.isoformat()
-            expires_at = (now + timedelta(minutes=duration)).isoformat()
-
-        c.execute(
-            "INSERT INTO promo_users(user_id,code) VALUES (?,?)",
-            (uid, code)
-        )
-        c.execute(
-            """
-            UPDATE promo_codes
-            SET used=used+1, started_at=?, expires_at=?
-            WHERE code=?
-            """,
-            (started_at or "", expires_at or "", code)
-        )
-        c.commit()
-        return True, expires_at or ""
-    except sqlite3.IntegrityError:
-        c.rollback()
-        return False, "Bu promo koddan oldin foydalangansiz."
-    except Exception:
-        c.rollback()
-        log.exception("Promo ishlatishda xato")
-        return False, "Promo kodni ishlatishda xatolik."
-    finally:
-        c.close()
-
-
-# ============================================================
 # PAYSTARS API
 # ============================================================
 def ps_headers(idempotency_key=None):
@@ -1124,23 +982,59 @@ def ps_pricing():
 # AKTIVSIM / DONUZ API
 # ============================================================
 def aktivsim_get(action, **params):
+    """AktivSim API chaqiruvini barqaror formatga keltiradi."""
     if not AKTIVSIM_API_KEY:
         return {"ok": False, "error": "AKTIVSIM_API_KEY/DONUZ_API_KEY sozlanmagan"}
 
+    params = dict(params)
     params["action"] = action
+    # AktivSim/VirtualSim turidagi API'larda ikkala nom ham uchraydi.
     params["apikey"] = AKTIVSIM_API_KEY
+    params.setdefault("api_key", AKTIVSIM_API_KEY)
+
     try:
         r = requests.get(
-            AKTIVSIM_BASE,
+            AKTIVSIM_BASE.rstrip("/") + "/",
             params=params,
-            timeout=20
+            timeout=30,
+            headers={"Accept": "application/json", "User-Agent": "DonuzBot/1.0"},
         )
+        raw = r.text[:4000]
         try:
-            return r.json()
+            data = r.json()
         except Exception:
-            return {"ok": False, "error": "API JSON qaytarmadi"}
-    except Exception:
-        return {"ok": False, "error": "AktivSim API bilan aloqa xatosi"}
+            return {
+                "ok": False,
+                "error": f"HTTP {r.status_code}: API JSON qaytarmadi: {raw[:500]}"
+            }
+
+        log.info("AktivSim %s | HTTP %s | %s", action, r.status_code, data)
+
+        if not r.ok:
+            return {"ok": False, "error": f"HTTP {r.status_code}", "raw": data}
+
+        # Turli AktivSim gateway formatlarini bitta formatga o'tkazamiz.
+        if isinstance(data, dict):
+            if data.get("ok") is True:
+                return data
+            if str(data.get("status", "")).lower() in ("success", "ok", "true"):
+                result = data.get("result", data.get("data", data))
+                return {"ok": True, "result": result, **data}
+            if "error" in data and not data.get("result") and not data.get("data"):
+                return {"ok": False, "error": str(data.get("error")), "raw": data}
+            if "data" in data and data.get("data") is not None:
+                return {"ok": True, "result": data["data"], **data}
+            if "result" in data:
+                return {"ok": True, "result": data["result"], **data}
+
+        # Ba'zi providerlar getCountries'ni to'g'ridan-to'g'ri dict/list qaytaradi.
+        if action == "getCountries" and isinstance(data, (list, dict)):
+            return {"ok": True, "result": data}
+
+        return {"ok": False, "error": "AktivSim API kutilmagan javob qaytardi", "raw": data}
+    except Exception as e:
+        log.exception("AktivSim API xatosi: %s", action)
+        return {"ok": False, "error": f"AktivSim API bilan aloqa xatosi: {e}"}
 
 
 def aktivsim_countries():
@@ -1157,7 +1051,6 @@ def aktivsim_buy(country_code):
 
 def aktivsim_code(order_id):
     return aktivsim_get("getCode", order_id=order_id)
-
 
 def aktivsim_sale_price(api_price):
     return float(
@@ -1264,10 +1157,7 @@ async def paystars_menu(update, context):
 
 async def ps_stars_start(update, context):
     q = update.callback_query
-    promo_code = context.user_data.get("promo_code")
     context.user_data.clear()
-    if promo_code:
-        context.user_data["promo_code"] = promo_code
     context.user_data["state"] = "ps_stars_username"
     await q.message.reply_text(
         "⭐ Stars\n\n@username yuboring:"
@@ -1276,10 +1166,7 @@ async def ps_stars_start(update, context):
 
 async def ps_premium_start(update, context):
     q = update.callback_query
-    promo_code = context.user_data.get("promo_code")
     context.user_data.clear()
-    if promo_code:
-        context.user_data["promo_code"] = promo_code
     context.user_data["state"] = "ps_premium_month"
     await q.message.reply_text(
         "💎 Premium muddatini tanlang:",
@@ -1310,29 +1197,22 @@ async def ps_confirm(update, context, kind):
         quantity = int(context.user_data.get("ps_quantity", 0))
         months = 0
         token = context.user_data.get("ps_token")
-        base_price = Decimal(str(context.user_data.get("ps_base_price", 0)))
+        price = float(context.user_data.get("ps_price", 0))
         label = f"⭐ {quantity} Stars"
     else:
         username = context.user_data.get("ps_username")
         quantity = 0
         months = int(context.user_data.get("ps_months", 0))
         token = context.user_data.get("ps_token")
-        base_price = Decimal(str(context.user_data.get("ps_base_price", 0)))
+        price = float(context.user_data.get("ps_price", 0))
         label = f"💎 Premium {months} oy"
-
-    if base_price <= 0:
-        base_price = Decimal(str(context.user_data.get("ps_price", 0) or 0))
-
-    promo = context.user_data.get("promo_code")
-    discount = promo_discount_for_user(uid, promo, base_price)
-    price = (base_price - discount).quantize(Decimal("1"))
 
     if not username or not token or price <= 0:
         await q.message.reply_text("❌ Buyurtma ma'lumotlari eskirgan.")
         context.user_data.clear()
         return
 
-    if get_balance(uid) < price:
+    if get_balance(uid) < Decimal(str(price)):
         await q.message.reply_text(
             f"❌ Balans yetarli emas.\n"
             f"Kerak: {price:,.0f} so'm\n"
@@ -1354,22 +1234,15 @@ async def ps_confirm(update, context, kind):
 
         save_external_order(
             uid, "paystars", kind, oid, username,
-            quantity, months, float(price), status
+            quantity, months, price, status
         )
-
-        if promo and discount > 0:
-            ok, promo_info = consume_promo_after_success(uid, promo)
-            if not ok:
-                log.warning("Promo consume failed after PayStars success: %s", promo_info)
-
         await q.message.reply_text(
             f"✅ <b>Buyurtma qabul qilindi!</b>\n\n"
             f"🆔 <code>{oid}</code>\n"
             f"👤 @{username}\n"
             f"{label}\n"
             f"💰 {price:,.0f} so'm\n"
-            + (f"🎁 Chegirma: {discount:,.0f} so'm\n" if discount else "")
-            + f"📊 {status}",
+            f"📊 {status}",
             parse_mode="HTML"
         )
         context.user_data.clear()
@@ -1401,43 +1274,77 @@ async def paystars_balance_admin(update, context):
 # ============================================================
 async def aktivsim_countries_handler(update, context):
     q = update.callback_query
+    await q.answer()
     if not AKTIVSIM_API_KEY:
         return await q.message.reply_text(
             "❌ AKTIVSIM_API_KEY yoki DONUZ_API_KEY sozlanmagan."
         )
 
     res = await asyncio.to_thread(aktivsim_countries)
-    if not res.get("ok") or not res.get("result"):
+    if not res.get("ok"):
+        log.error("AktivSim countries failed: %s", res)
+        err = str(res.get("error", "Noma'lum xato"))[:500]
         return await q.message.reply_text(
-            "❌ AktivSim davlatlar ro'yxatini olishda xatolik."
+            "❌ AktivSim davlatlar ro'yxatini olishda xatolik.\n"
+            f"Sabab: {err}"
+        )
+
+    raw = res.get("result", [])
+    if isinstance(raw, dict):
+        # {"1": "Russia"} yoki {"1": {"name": "Russia", ...}}
+        countries = []
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                item = dict(value)
+                item.setdefault("country_code", item.get("id", key))
+                item.setdefault("name", item.get("eng") or item.get("name") or key)
+                countries.append(item)
+            else:
+                countries.append({"country_code": key, "name": str(value)})
+    elif isinstance(raw, list):
+        countries = raw
+    else:
+        countries = []
+
+    if not countries:
+        return await q.message.reply_text(
+            "❌ AktivSim davlatlar ro'yxati bo'sh yoki API formati o'zgargan."
         )
 
     c = conn()
-    custom = {
-        row["country_code"]: row["custom_price"]
-        for row in c.execute(
-            "SELECT country_code,custom_price FROM custom_prices"
-        ).fetchall()
-    }
-    c.close()
+    try:
+        custom = {
+            str(row["country_code"]): row["custom_price"]
+            for row in c.execute(
+                "SELECT country_code,custom_price FROM custom_prices"
+            ).fetchall()
+        }
+    except Exception:
+        custom = {}
+    finally:
+        c.close()
 
     rows = []
-    for country in res["result"][:50]:
-        code = country.get("country_code")
-        name = country.get("name", code)
+    for country in countries[:50]:
+        if not isinstance(country, dict):
+            continue
+        code = str(country.get("country_code", country.get("id", "")))
+        if not code:
+            continue
+        name = country.get("name") or country.get("eng") or country.get("rus") or code
         flag = country.get("flag", "")
-        api_price = float(country.get("price", 0) or 0)
+        api_price = float(country.get("price", country.get("cost", 0)) or 0)
         final = float(custom.get(code, aktivsim_sale_price(api_price)))
-        rows.append([
-            InlineKeyboardButton(
-                f"{flag} {name} — {final:,.0f} so'm",
-                callback_data=f"as_country_{code}"
-            )
-        ])
+        price_text = f" — {final:,.0f} so'm" if api_price or code in custom else ""
+        rows.append([InlineKeyboardButton(
+            f"{flag} {name}{price_text}",
+            callback_data=f"as_country_{code}"
+        )])
 
-    rows.append([
-        InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")
-    ])
+    if not rows:
+        return await q.message.reply_text("❌ AktivSim davlatlar ro'yxatida yaroqli davlat topilmadi.")
+
+    rows.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")])
     await q.message.reply_text(
         "🌍 <b>Virtual raqam</b>\n\nDavlatni tanlang:",
         parse_mode="HTML",
@@ -1450,12 +1357,14 @@ async def aktivsim_country_handler(update, context):
     uid = q.from_user.id
     code = q.data[len("as_country_"):]
     res = await asyncio.to_thread(aktivsim_countries)
-    if not res.get("ok") or not res.get("result"):
-        return await q.message.reply_text("❌ AktivSim API xatosi.")
+    if not res.get("ok"):
+        return await q.message.reply_text(f"❌ AktivSim API xatosi.\n{str(res.get('error', ''))[:400]}")
 
+    raw = res.get("result", [])
+    if isinstance(raw, dict):
+        raw = [dict(v, country_code=k) if isinstance(v, dict) else {"country_code": k, "name": str(v)} for k, v in raw.items()]
     country = next(
-        (x for x in res["result"]
-         if str(x.get("country_code")) == str(code)),
+        (x for x in raw if str(x.get("country_code", x.get("id", ""))) == str(code)),
         None
     )
     if not country:
@@ -2854,36 +2763,109 @@ async def confirm_order(
         )
     )
 
-    promo = context.user_data.get("promo_code")
-    discount = promo_discount_for_user(
-        message.chat_id,
-        promo,
-        price
-    ) if promo else Decimal("0")
+    promo = context.user_data.get(
+        "promo_code"
+    )
 
-    final_price = max(Decimal("0"), price - discount)
+    discount = Decimal("0")
 
-    context.user_data["final_price"] = final_price
-    context.user_data["promo_discount"] = discount
+    if promo:
 
-    player_id = str(context.user_data.get("player_id", "")).strip()
-    server_id = str(context.user_data.get("server_id", "")).strip()
-    id_label = context.user_data.get("id_label", "Player ID")
+        c = conn()
+
+        r = c.execute(
+            """
+            SELECT *
+            FROM promo_codes
+            WHERE code=?
+              AND active=1
+            """,
+            (promo,)
+        ).fetchone()
+
+        c.close()
+
+        if r and (
+            r["max_uses"] == 0
+            or r["used"] < r["max_uses"]
+        ):
+
+            discount = (
+                price
+                *
+                Decimal(
+                    str(r["percent"])
+                )
+                /
+                Decimal("100")
+            )
+
+    final_price = max(
+        Decimal("0"),
+        price - discount
+    )
+
+    context.user_data[
+        "final_price"
+    ] = final_price
+
+    player_id = str(
+        context.user_data.get(
+            "player_id",
+            ""
+        )
+    ).strip()
+
+    server_id = str(
+        context.user_data.get(
+            "server_id",
+            ""
+        )
+    ).strip()
+
+    id_label = context.user_data.get(
+        "id_label",
+        "Player ID"
+    )
 
     extra = ""
-    if context.user_data.get("requires_server", False):
-        extra = f"🌐 Server ID: {server_id}\n"
+
+    if context.user_data.get(
+        "requires_server",
+        False
+    ):
+
+        extra = (
+            f"🌐 Server ID: {server_id}\n"
+        )
 
     await message.reply_text(
         f"📦 {context.user_data.get('offer_name','Paket')}\n\n"
         f"🆔 {id_label}: {player_id}\n"
         f"{extra}"
         f"💰 Narx: {final_price:,.0f} so'm\n"
-        + (f"🎁 Chegirma: {discount:,.0f} so'm\n" if discount else "")
-        + "\nBuyurtmani tasdiqlaysizmi?",
+        +
+        (
+            f"🎁 Chegirma: "
+            f"{discount:,.0f} so'm\n"
+            if discount
+            else ""
+        )
+        +
+        "\nBuyurtmani tasdiqlaysizmi?",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Tasdiqlash", callback_data="confirm")],
-            [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")]
+            [
+                InlineKeyboardButton(
+                    "✅ Tasdiqlash",
+                    callback_data="confirm"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Bekor qilish",
+                    callback_data="cancel"
+                )
+            ]
         ])
     )
 
@@ -2925,22 +2907,6 @@ async def confirm(update, context):
         )
 
         return
-
-    promo = context.user_data.get("promo_code")
-    if promo:
-        base_price = Decimal(str(context.user_data.get("price", 0) or 0))
-        fresh_discount = promo_discount_for_user(uid, promo, base_price)
-        fresh_price = max(Decimal("0"), base_price - fresh_discount).quantize(Decimal("1"))
-        if fresh_discount <= 0:
-            price = base_price
-            context.user_data["final_price"] = price
-            await q.message.reply_text(
-                "⚠️ Promo kodi endi amal qilmaydi yoki muddati tugagan.\n"
-                f"💰 Oddiy narx: {price:,.0f} so'm"
-            )
-        else:
-            price = fresh_price
-            context.user_data["final_price"] = price
 
     current = get_balance(uid)
 
@@ -3242,11 +3208,52 @@ async def confirm(update, context):
     # PROMO
     # ========================================================
 
-    promo = context.user_data.get("promo_code")
+    promo = context.user_data.get(
+        "promo_code"
+    )
+
     if promo:
-        ok, promo_info = consume_promo_after_success(uid, promo)
-        if not ok:
-            log.warning("Promo consume failed after PlayPay success: %s", promo_info)
+
+        c = conn()
+
+        exists = c.execute(
+            """
+            SELECT 1
+            FROM promo_users
+            WHERE user_id=?
+              AND code=?
+            """,
+            (
+                uid,
+                promo
+            )
+        ).fetchone()
+
+        if not exists:
+
+            c.execute(
+                """
+                INSERT OR IGNORE INTO promo_users
+                (user_id,code)
+                VALUES (?,?)
+                """,
+                (
+                    uid,
+                    promo
+                )
+            )
+
+            c.execute(
+                """
+                UPDATE promo_codes
+                SET used=used+1
+                WHERE code=?
+                """,
+                (promo,)
+            )
+
+        c.commit()
+        c.close()
 
     context.user_data.clear()
 
@@ -3368,24 +3375,18 @@ async def text_handler(update, context):
             return
         try:
             pricing = await asyncio.to_thread(ps_pricing)
-            base_price = ps_sell(float(pricing.get("star_price", 0)) * quantity)
-            if base_price <= 0:
+            price = ps_sell(float(pricing.get("star_price", 0)) * quantity)
+            if price <= 0:
                 raise RuntimeError
-            promo_code = context.user_data.get("promo_code")
-            discount = promo_discount_for_user(u.id, promo_code, base_price)
-            price = float(max(Decimal("0"), Decimal(str(base_price)) - discount))
             context.user_data["ps_quantity"] = quantity
-            context.user_data["ps_base_price"] = float(base_price)
             context.user_data["ps_price"] = price
-            context.user_data["ps_discount"] = float(discount)
             context.user_data["state"] = None
             await update.message.reply_text(
                 f"⭐ Stars\n\n"
                 f"👤 @{context.user_data['ps_username']}\n"
                 f"⭐ {quantity}\n"
-                f"💰 Narx: {price:,.0f} so'm\n"
-                + (f"🎁 Chegirma: {discount:,.0f} so'm\n" if discount else "")
-                + f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\n"
+                f"💰 {price:,.0f} so'm\n"
+                f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\n"
                 "Tasdiqlaysizmi?",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ Tasdiqlash", callback_data="ps_confirm_stars"),
@@ -3410,25 +3411,19 @@ async def text_handler(update, context):
             if not r.get("valid"):
                 raise RuntimeError
             pricing = await asyncio.to_thread(ps_pricing)
-            base_price = ps_sell(float(pricing.get(f"premium_{months}_price", 0)))
-            if base_price <= 0:
+            price = ps_sell(float(pricing.get(f"premium_{months}_price", 0)))
+            if price <= 0:
                 raise RuntimeError
-            promo_code = context.user_data.get("promo_code")
-            discount = promo_discount_for_user(u.id, promo_code, base_price)
-            price = float(max(Decimal("0"), Decimal(str(base_price)) - discount))
             context.user_data["ps_username"] = name
             context.user_data["ps_token"] = r.get("verification_token")
-            context.user_data["ps_base_price"] = float(base_price)
             context.user_data["ps_price"] = price
-            context.user_data["ps_discount"] = float(discount)
             context.user_data["state"] = None
             await update.message.reply_text(
                 f"💎 Premium\n\n"
                 f"👤 @{name}\n"
                 f"💎 {months} oy\n"
-                f"💰 Narx: {price:,.0f} so'm\n"
-                + (f"🎁 Chegirma: {discount:,.0f} so'm\n" if discount else "")
-                + f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\n"
+                f"💰 {price:,.0f} so'm\n"
+                f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\n"
                 "Tasdiqlaysizmi?",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ Tasdiqlash", callback_data="ps_confirm_premium"),
@@ -3573,14 +3568,6 @@ async def text_handler(update, context):
 
             await update.message.reply_text(
                 "❌ Promo kod noto'g'ri."
-            )
-
-            return
-
-        if promo_is_expired(r):
-
-            await update.message.reply_text(
-                "❌ Promo kodining amal qilish vaqti tugagan."
             )
 
             return
@@ -4674,13 +4661,18 @@ async def price_callback(update, context):
 async def admin_promo_start(update, context):
 
     q = update.callback_query
+
     context.user_data.clear()
-    context.user_data["admin_state"] = "promo_admin_code"
+
+    context.user_data[
+        "admin_state"
+    ] = "promo_admin"
 
     await q.message.reply_text(
-        "🎁 Promo yaratish\n\n"
-        "1/4 — Promo kod nomini yuboring.\n"
-        "Masalan: SALE10"
+        "🎁 Promo yaratish:\n\n"
+        "KOD FOIZ LIMIT\n\n"
+        "Misol: SALE10 10 100\n"
+        "0 limit = cheksiz"
     )
 
 
@@ -5087,96 +5079,73 @@ async def admin_text_handler(update, context):
     # PROMO ADMIN
     # ========================================================
 
-    if state == "promo_admin_code":
-        code = text.strip().upper()
-        if not code or len(code) > 32 or any(ch.isspace() for ch in code):
-            await update.message.reply_text("❌ Promo kodini to'g'ri yuboring. Masalan: SALE10")
-            return True
-        c = conn()
-        exists = c.execute("SELECT 1 FROM promo_codes WHERE code=?", (code,)).fetchone()
-        c.close()
-        if exists:
-            await update.message.reply_text("❌ Bu promo kod allaqachon mavjud. Boshqa kod yuboring.")
-            return True
-        context.user_data["promo_new_code"] = code
-        context.user_data["admin_state"] = "promo_admin_percent"
-        await update.message.reply_text("2/4 — Chegirma foizini yuboring.\nMasalan: 10")
-        return True
+    if state == "promo_admin":
 
-    if state == "promo_admin_percent":
+        parts = text.split()
+
+        if len(parts) != 3:
+
+            await update.message.reply_text(
+                "Format: SALE10 10 100"
+            )
+
+            return True
+
+        code = parts[0].upper()
+
         try:
-            percent = float(text.replace(",", ".").strip())
-        except Exception:
-            await update.message.reply_text("❌ Foiz raqam bo'lsin. Masalan: 10")
-            return True
-        if percent <= 0 or percent > 100:
-            await update.message.reply_text("❌ Foiz 1 dan 100 gacha bo'lsin.")
-            return True
-        context.user_data["promo_new_percent"] = percent
-        context.user_data["admin_state"] = "promo_admin_limit"
-        await update.message.reply_text(
-            "3/4 — Nechta marta ishlatilishini yuboring.\n"
-            "Masalan: 100\n0 = cheksiz"
-        )
-        return True
 
-    if state == "promo_admin_limit":
-        try:
-            limit = int(text.replace(" ", "").strip())
-        except Exception:
-            await update.message.reply_text("❌ Limit butun son bo'lsin. Masalan: 100")
-            return True
-        if limit < 0:
-            await update.message.reply_text("❌ Limit 0 yoki undan katta bo'lsin.")
-            return True
-        context.user_data["promo_new_limit"] = limit
-        context.user_data["admin_state"] = "promo_admin_duration"
-        await update.message.reply_text(
-            "4/4 — Promo birinchi ishlatilgandan keyin qancha vaqt amal qilsin?\n\n"
-            "Daqiqada yuboring. Masalan: 30\n"
-            "0 = vaqt cheklovisiz\n\n"
-            "Muhim: timer promo yaratilganda emas, birinchi muvaffaqiyatli ishlatilganda boshlanadi."
-        )
-        return True
+            percent = float(parts[1])
+            limit = int(parts[2])
 
-    if state == "promo_admin_duration":
-        try:
-            duration = int(text.replace(" ", "").strip())
         except Exception:
-            await update.message.reply_text("❌ Daqiqa butun son bo'lsin. Masalan: 30")
-            return True
-        if duration < 0:
-            await update.message.reply_text("❌ Daqiqa 0 yoki undan katta bo'lsin.")
+
+            await update.message.reply_text(
+                "❌ Foiz va limit raqam bo'lsin."
+            )
+
             return True
 
-        code = context.user_data.get("promo_new_code", "")
-        percent = float(context.user_data.get("promo_new_percent", 0))
-        limit = int(context.user_data.get("promo_new_limit", 0))
+        if (
+            percent <= 0
+            or percent > 100
+            or limit < 0
+        ):
+
+            await update.message.reply_text(
+                "❌ Qiymatlar noto'g'ri."
+            )
+
+            return True
 
         c = conn()
+
         c.execute(
             """
             INSERT OR REPLACE INTO promo_codes
-            (code,percent,max_uses,used,active,duration_minutes,started_at,expires_at)
-            VALUES (?,?,?,0,1,?,'','')
+            (code,percent,max_uses,used,active)
+            VALUES (?,?,?,0,1)
             """,
-            (code, percent, limit, duration)
+            (
+                code,
+                percent,
+                limit
+            )
         )
+
         c.commit()
         c.close()
 
         context.user_data.clear()
-        duration_text = "cheksiz" if duration == 0 else f"{duration} daqiqa"
-        limit_text = "cheksiz" if limit == 0 else str(limit)
+
         await update.message.reply_text(
-            f"✅ Promo yaratildi!\n\n"
-            f"🎁 Kod: {code}\n"
-            f"💸 Chegirma: {percent:g}%\n"
-            f"🔢 Limit: {limit_text}\n"
-            f"⏱ Amal qilish: {duration_text}\n\n"
-            "⏳ Timer birinchi muvaffaqiyatli ishlatilganda boshlanadi.",
+            f"✅ Promo yaratildi!\n"
+            f"🎁 {code}\n"
+            f"💸 {percent}%\n"
+            f"🔢 Limit: {limit}",
             reply_markup=admin_kb()
         )
+
         return True
 
     # ========================================================
