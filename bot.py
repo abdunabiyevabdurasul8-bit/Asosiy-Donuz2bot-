@@ -327,12 +327,6 @@ def init_db():
         status TEXT DEFAULT 'trial',
         markup_uzs REAL DEFAULT 0
     );
-
-    CREATE TABLE IF NOT EXISTS subscription_plans(
-        days INTEGER PRIMARY KEY,
-        price_uzs REAL NOT NULL,
-        active INTEGER DEFAULT 1
-    );
     """)
 
     c.commit()
@@ -345,14 +339,6 @@ def init_db():
 
     if active_db() == MAIN_DB:
         c = conn()
-        plans = [
-            (7, float(os.getenv("SUB_PRICE_7", "15000"))),
-            (30, float(os.getenv("SUB_PRICE_30", "30000"))),
-            (90, float(os.getenv("SUB_PRICE_90", "75000"))),
-            (365, float(os.getenv("SUB_PRICE_365", "250000"))),
-        ]
-        for days, price in plans:
-            c.execute("INSERT OR IGNORE INTO subscription_plans(days,price_uzs,active) VALUES (?,?,1)", (days, price))
         c.execute("""
             CREATE TABLE IF NOT EXISTS custom_prices(
                 country_code TEXT PRIMARY KEY,
@@ -464,7 +450,7 @@ def ensure_external_schema():
 
 
 # ============================================================
-# BOT PLATFORM / SUBSCRIPTION
+# BOT PLATFORM
 # ============================================================
 
 def token_cipher():
@@ -512,31 +498,19 @@ def set_request_db(context):
 
 
 def child_active(row):
-    if not row:
-        return False
-    now = datetime.now()
-    trial = datetime.fromisoformat(row["trial_until"]) if row["trial_until"] else now
-    sub = datetime.fromisoformat(row["subscription_until"]) if row["subscription_until"] else None
-    return now < trial or (sub and now < sub)
+    # Child botlar doim faol.
+    return bool(row)
 
 
 def child_grace_expired(row):
-    if not row:
-        return True
-    return datetime.now() >= datetime.fromisoformat(row["grace_until"])
+    # Muddat bo'yicha o'chirish yo'q.
+    return False
 
 
 def child_status(row):
     if not row:
         return "deleted"
-    now = datetime.now()
-    trial = datetime.fromisoformat(row["trial_until"]) if row["trial_until"] else now
-    sub = datetime.fromisoformat(row["subscription_until"]) if row["subscription_until"] else None
-    if now < trial:
-        return "trial"
-    if sub and now < sub:
-        return "active"
-    return "expired"
+    return "active"
 
 
 def refresh_child_status(bot_id):
@@ -572,11 +546,6 @@ def child_turnover(bot_id):
     return int(row[0] or 0), float(row[1] or 0)
 
 
-def subscription_plans():
-    c = main_conn()
-    rows = c.execute("SELECT * FROM subscription_plans WHERE active=1 ORDER BY days").fetchall()
-    c.close()
-    return rows
 
 
 def format_dt(value):
@@ -620,8 +589,9 @@ async def create_child_bot(owner_id, owner_username, token):
         return me, False
 
     now = datetime.now()
-    trial = now + timedelta(days=1)
-    grace = trial + timedelta(days=7)
+    # Eski DB ustunlari saqlanadi, lekin ular endi hech qanday cheklov bermaydi.
+    trial = now
+    grace = now
     db_path = str(CHILD_DIR / f"{bot_id}.db")
     CURRENT_DB.set(db_path)
     init_db(); ensure_external_schema()
@@ -629,7 +599,7 @@ async def create_child_bot(owner_id, owner_username, token):
     # copy current catalog/settings into child DB
     copy_catalog_to_child(db_path)
     c = main_conn()
-    c.execute("""INSERT INTO child_bots(bot_id,bot_username,bot_name,owner_user_id,owner_username,token_enc,db_path,created_at,trial_until,subscription_until,grace_until,status,markup_uzs) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)""", (bot_id, me.get("username", ""), me.get("first_name", ""), int(owner_id), owner_username or "", encrypt_token(token), db_path, now.isoformat(), trial.isoformat(), "", grace.isoformat(), "trial"))
+    c.execute("""INSERT INTO child_bots(bot_id,bot_username,bot_name,owner_user_id,owner_username,token_enc,db_path,created_at,trial_until,subscription_until,grace_until,status,markup_uzs) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)""", (bot_id, me.get("username", ""), me.get("first_name", ""), int(owner_id), owner_username or "", encrypt_token(token), db_path, now.isoformat(), trial.isoformat(), "", grace.isoformat(), "active"))
     c.commit(); c.close()
     await start_child_bot(bot_id)
     return me, True
@@ -703,24 +673,27 @@ async def stop_child_bot(bot_id):
 
 
 async def manage_child_bots(context):
+    # Child botlar muddat sababli o'chirilmaydi.
     set_request_db(context)
-    c = main_conn(); rows = c.execute("SELECT * FROM child_bots").fetchall(); c.close()
+    c = main_conn()
+    rows = c.execute("SELECT * FROM child_bots").fetchall()
+    c.close()
+
     for row in rows:
-        status = child_status(row)
-        if status == "expired" and child_grace_expired(row):
-            await stop_child_bot(int(row["bot_id"]))
-            try:
-                Path(row["db_path"]).unlink(missing_ok=True)
-            except Exception:
-                pass
-            c = main_conn(); c.execute("DELETE FROM child_bots WHERE bot_id=?", (row["bot_id"],)); c.commit(); c.close()
-            continue
-        c = main_conn(); c.execute("UPDATE child_bots SET status=? WHERE bot_id=?", (status, row["bot_id"])); c.commit(); c.close()
-        if status in ("trial", "active") and int(row["bot_id"]) not in CHILD_APPS:
-            try: await start_child_bot(int(row["bot_id"]))
-            except Exception: log.exception("Child bot start xatosi")
-        elif status == "expired" and int(row["bot_id"]) in CHILD_APPS:
-            await stop_child_bot(int(row["bot_id"]))
+        bot_id = int(row["bot_id"])
+        try:
+            c = main_conn()
+            c.execute(
+                "UPDATE child_bots SET status='active' WHERE bot_id=?",
+                (bot_id,)
+            )
+            c.commit()
+            c.close()
+
+            if bot_id not in CHILD_APPS:
+                await start_child_bot(bot_id)
+        except Exception:
+            log.exception("Child bot start xatosi")
 
 
 def build_application(token, child=False):
@@ -740,79 +713,8 @@ def build_application(token, child=False):
 
 
 async def child_platform_access(update, context):
-    if not is_child_bot(context):
-        return True
-    row = child_bot_row(context.bot.id)
-    if not row:
-        return False
-    status = child_status(row)
-    if status in ("trial", "active"):
-        return True
-    await update.effective_message.reply_text(
-        "⛔ Obuna faol emas.\n\n"
-        "Bot egasi asosiy botga kirib obuna sotib olishi kerak.\n"
-        f"📅 Saqlash muddati: {format_dt(row['grace_until'])} gacha."
-    )
-    return False
-
-
-async def subscription_menu(update, context):
-    q = update.callback_query
-    rows = subscription_plans()
-    text = "💳 <b>Bot obunasi</b>\n\n1 kunlik sinov muddati bepul.\n\n"
-    kb=[]
-    for r in rows:
-        text += f"📅 {r['days']} kun — {r['price_uzs']:,.0f} so'm\n"
-        kb.append([InlineKeyboardButton(f"{r['days']} kun — {r['price_uzs']:,.0f} so'm", callback_data=f"sub_buy_{r['days']}")])
-    kb.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")])
-    await q.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
-
-async def buy_subscription(update, context, days):
-    q=update.callback_query
-    if is_child_bot(context):
-        await q.message.reply_text("Obunani asosiy platforma botidan sotib oling.")
-        return
-    c=main_conn(); plan=c.execute("SELECT * FROM subscription_plans WHERE days=? AND active=1",(days,)).fetchone(); c.close()
-    if not plan:
-        return await q.message.reply_text("❌ Obuna paketi topilmadi.")
-    price=Decimal(str(plan["price_uzs"]))
-    uid=q.from_user.id
-    if get_balance(uid)<price:
-        return await q.message.reply_text(f"❌ Balans yetarli emas.\nKerak: {price:,.0f} so'm\nBalans: {get_balance(uid):,.0f} so'm")
-    c=main_conn(); bots=c.execute("SELECT * FROM child_bots WHERE owner_user_id=? ORDER BY created_at DESC",(uid,)).fetchall(); c.close()
-    if not bots:
-        return await q.message.reply_text("Avval 🤖 Bot qo'shing.")
-    if len(bots)>1:
-        context.user_data["subscription_days"]=days
-        kb=[[InlineKeyboardButton(f"@{b['bot_username'] or b['bot_id']}",callback_data=f"sub_choose_{b['bot_id']}")] for b in bots]
-        kb.append([InlineKeyboardButton("❌ Bekor qilish",callback_data="cancel")])
-        return await q.message.reply_text("Obuna qaysi bot uchun?",reply_markup=InlineKeyboardMarkup(kb))
-    await activate_subscription(bots[0]["bot_id"], uid, days, price, context)
-
-
-async def activate_subscription(bot_id, uid, days, price, context):
-    c=main_conn(); row=c.execute("SELECT * FROM child_bots WHERE bot_id=? AND owner_user_id=?",(bot_id,uid)).fetchone(); c.close()
-    if not row:
-        return await context.bot.send_message(uid,"❌ Bot topilmadi.")
-    now=datetime.now()
-    current=datetime.fromisoformat(row["subscription_until"]) if row["subscription_until"] else now
-    start=max(now,current)
-    until=start+timedelta(days=days)
-    grace=until+timedelta(days=7)
-    add_balance(uid,-price,"subscription",f"Bot obunasi {days} kun")
-    c=main_conn(); c.execute("UPDATE child_bots SET subscription_until=?,grace_until=?,status=? WHERE bot_id=?",(until.isoformat(),grace.isoformat(),"active",bot_id)); c.commit(); c.close()
-    await start_child_bot(int(bot_id))
-    await context.bot.send_message(uid,f"✅ Obuna faollashtirildi!\n\n🤖 @{row['bot_username'] or bot_id}\n📅 {days} kun\n⏰ Tugaydi: {format_dt(until.isoformat())}")
-
-
-async def choose_subscription_bot(update, context, bot_id):
-    days=int(context.user_data.get("subscription_days",0))
-    c=main_conn(); plan=c.execute("SELECT price_uzs FROM subscription_plans WHERE days=?",(days,)).fetchone(); c.close()
-    if not plan:
-        return
-    await activate_subscription(bot_id, update.effective_user.id, days, Decimal(str(plan["price_uzs"])), context)
-    context.user_data.clear()
+    # Platforma cheklovi yo'q.
+    return True
 
 
 async def add_bot_start(update, context):
@@ -834,8 +736,7 @@ async def bot_manage(update, context, bot_id):
     q=update.callback_query; r=child_bot_row(bot_id)
     if not r or int(r["owner_user_id"])!=q.from_user.id: return await q.message.reply_text("❌ Bu bot sizniki emas.")
     orders,turn=child_turnover(bot_id); st=child_status(r)
-    until=r["subscription_until"] or r["trial_until"]
-    text=(f"🤖 <b>@{r['bot_username'] or bot_id}</b>\n\n🆔 Bot ID: <code>{bot_id}</code>\n👤 Egasi ID: <code>{r['owner_user_id']}</code>\n📅 Qo'shilgan: {format_dt(r['created_at'])}\n💰 Aylanma: {turn:,.0f} so'm\n📦 Buyurtmalar: {orders}\n🟢 Holati: {st}\n⏰ Muddati: {format_dt(until)}\n💵 Ustama: {r['markup_uzs']:,.0f} so'm")
+    text=(f"🤖 <b>@{r['bot_username'] or bot_id}</b>\n\n🆔 Bot ID: <code>{bot_id}</code>\n👤 Egasi ID: <code>{r['owner_user_id']}</code>\n📅 Qo'shilgan: {format_dt(r['created_at'])}\n💰 Aylanma: {turn:,.0f} so'm\n📦 Buyurtmalar: {orders}\n🟢 Holati: ♾️ Doimiy faol\n💵 Ustama: {r['markup_uzs']:,.0f} so'm")
     kb=[[InlineKeyboardButton("⚙️ Botlar sozlamalari",callback_data=f"bot_settings_{bot_id}")],[InlineKeyboardButton("▶️ Ishga tushirish",callback_data=f"bot_start_{bot_id}"),InlineKeyboardButton("⛔ To'xtatish",callback_data=f"bot_stop_{bot_id}")],[InlineKeyboardButton("🔙 Orqaga",callback_data="bot_list")]]
     await q.message.reply_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
@@ -858,7 +759,6 @@ async def bot_markup_start(update, context, bot_id):
 async def bot_start_manual(update, context, bot_id):
     q=update.callback_query; r=child_bot_row(bot_id)
     if not r or int(r["owner_user_id"])!=q.from_user.id: return
-    if not child_active(r): return await q.message.reply_text("⛔ Obuna faol emas.")
     await start_child_bot(int(bot_id)); await q.message.reply_text("▶️ Bot ishga tushirildi.")
 
 
@@ -883,7 +783,7 @@ async def admin_bot_detail(update, context, bot_id):
     r=child_bot_row(bot_id)
     if not r: return await q.message.reply_text("❌ Bot topilmadi.")
     orders,turn=child_turnover(bot_id)
-    text=(f"🤖 <b>@{r['bot_username'] or bot_id}</b>\n\n🆔 Bot ID: <code>{bot_id}</code>\n👤 Egasi: @{r['owner_username'] or 'username'}\n👤 Owner ID: <code>{r['owner_user_id']}</code>\n📅 Qo'shilgan: {format_dt(r['created_at'])}\n💰 Aylanma: {turn:,.0f} so'm\n📦 Buyurtmalar: {orders}\n🟢 Holati: {child_status(r)}\n⏰ Trial: {format_dt(r['trial_until'])}\n💳 Obuna: {format_dt(r['subscription_until'])}\n🗑 Saqlash: {format_dt(r['grace_until'])}")
+    text=(f"🤖 <b>@{r['bot_username'] or bot_id}</b>\n\n🆔 Bot ID: <code>{bot_id}</code>\n👤 Egasi: @{r['owner_username'] or 'username'}\n👤 Owner ID: <code>{r['owner_user_id']}</code>\n📅 Qo'shilgan: {format_dt(r['created_at'])}\n💰 Aylanma: {turn:,.0f} so'm\n📦 Buyurtmalar: {orders}\n🟢 Holati: ♾️ Doimiy faol")
     kb=[[InlineKeyboardButton("▶️ Ishga tushirish",callback_data=f"adm_bot_start_{bot_id}"),InlineKeyboardButton("⛔ To'xtatish",callback_data=f"adm_bot_stop_{bot_id}")],[InlineKeyboardButton("🔙 Orqaga",callback_data="adm_bots")]]
     await q.message.reply_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
@@ -2294,7 +2194,6 @@ def main_menu():
         [InlineKeyboardButton("🤖 Bot qo'shish", callback_data="bot_add")],
         [InlineKeyboardButton("🤖 Botlarim", callback_data="bot_list")],
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
-        [InlineKeyboardButton("💳 Obuna sotib olish", callback_data="subscription")],
         [InlineKeyboardButton("💳 Balans to'ldirish", callback_data="deposit")],
         [InlineKeyboardButton("📦 Buyurtmalarim", callback_data="orders")],
         [
@@ -3447,9 +3346,7 @@ async def text_handler(update, context):
                 f"{bot_action}\n\n"
                 f"🤖 @{me.get('username','')}\n"
                 f"🆔 Bot ID: {me['id']}\n"
-                f"🧪 Sinov: 1 kun\n"
-                f"⏰ Sinov tugashi: {format_dt(status['trial_until'])}\n\n"
-                "Obuna faol bo'lmasa bot ishlamaydi.",
+                "♾️ Obunasiz — doimiy ishlaydi.",
                 reply_markup=main_menu()
             )
         except Exception as e:
@@ -5703,12 +5600,6 @@ async def callback_router(update, context):
         return await paystars_balance_admin(update, context)
     if d == "adm_aktivsim_balance":
         return await aktivsim_balance_admin(update, context)
-    if d == "subscription":
-        return await subscription_menu(update, context)
-    if d.startswith("sub_buy_"):
-        return await buy_subscription(update, context, int(d.split("_")[-1]))
-    if d.startswith("sub_choose_"):
-        return await choose_subscription_bot(update, context, int(d.split("_")[-1]))
     if d == "bot_add":
         return await add_bot_start(update, context)
     if d == "bot_list":
@@ -5729,7 +5620,7 @@ async def callback_router(update, context):
         return await admin_bot_detail(update, context, int(d.split("_")[-1]))
     if d.startswith("adm_bot_start_"):
         bot_id=int(d.split("_")[-1]); r=child_bot_row(bot_id)
-        if q.from_user.id==ADMIN_ID and r and child_active(r): await start_child_bot(bot_id)
+        if q.from_user.id==ADMIN_ID and r: await start_child_bot(bot_id)
         return await q.message.reply_text("▶️ Bot ishga tushirildi.")
     if d.startswith("adm_bot_stop_"):
         bot_id=int(d.split("_")[-1])
