@@ -3464,7 +3464,8 @@ async def games(update, context):
                     CASE
                         WHEN game_id=? THEN 0
                         WHEN game_id=? THEN 1
-                        ELSE 2
+                        WHEN game_id=? THEN 2
+                        ELSE 3
                     END,
                     name
                 """,
