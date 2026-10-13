@@ -4895,7 +4895,7 @@ async def text_handler(update, context):
 
         await update.message.reply_text(
             "✅ ID qabul qilindi.\n"
-            "ℹ️ Bay2Game IDni oldindan tekshirmaydi; tekshiruv buyurtma yuborilganda amalga oshadi.\n\n"
+            "ℹ️ Doniz IDni oldindan tekshirmaydi; tekshiruv buyurtma yuborilganda amalga oshadi.\n\n"
             f"🆔 ID: <code>{html.escape(player_id)}</code>",
             parse_mode="HTML"
         )
