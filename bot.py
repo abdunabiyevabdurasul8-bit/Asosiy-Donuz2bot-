@@ -1991,7 +1991,7 @@ def bay2game_request(path, params=None):
         return response.status_code, data
     except Exception as exc:
         log.exception("Bay2Game API so'rovi xatosi: %s", path)
-        return 0, {"ok": False, "error": str(exc)}
+        return 0, {"ok": False, "error": "Xatolik yuz berdi."}
 
 
 def api_headers():
@@ -2169,16 +2169,18 @@ def get_packages_api(game_id):
 
 
 def playpay_check_id(game_id, player_id, server_id=None, charname=None):
-    # Bay2Game hujjatlarida alohida check-ID endpointi yo'q. Shuning uchun ID oldindan
-    # tekshirilmaydi; buyurtma API ga yuborilganda provider tekshiradi.
+    # API alohida o'yinchi-tekshiruv endpointini bermaydi. Shu sababli bu yerda
+    # faqat ID matni tekshiriladi; akkaunt egasi ekanligi buyurtma yuborilganda aniqlanadi.
     player_id = str(player_id or "").strip()
     if not player_id:
-        return 400, {"ok": False, "valid": False, "error": "Player ID kiritilmagan."}
+        return 400, {"ok": False, "valid": False, "error": "ID kiritilmagan."}
+    if len(player_id) > 100 or not re.fullmatch(r"[A-Za-z0-9_.-]+", player_id):
+        return 400, {"ok": False, "valid": False, "error": "ID formati noto'g'ri. ID ni tekshirib qayta yuboring."}
     return 200, {
         "ok": True,
         "valid": True,
         "player_name": player_id,
-        "message": "Bay2Game IDni oldindan tekshirmaydi; ID buyurtmada yuboriladi.",
+        "message": "ID formati qabul qilindi. Akkaunt buyurtma yuborilganda tekshiriladi.",
         "validation_supported": False,
     }
 
@@ -2198,7 +2200,7 @@ def bay2game_create_order(product_code, player_id, server_id=""):
     order_status = str(payload.get("status") or nested.get("status") or raw.get("status") or "processing").lower()
     failed = (status < 200 or status >= 300 or not raw.get("ok") or order_status in ("failed", "failure", "error"))
     if failed:
-        return status, {"ok": False, "error": raw.get("error") or raw.get("message") or "Bay2Game buyurtmani qabul qilmadi.", "raw": raw}
+        return status, {"ok": False, "error": "Buyurtma qabul qilinmadi.", "raw": raw}
     provider_reference = str(payload.get("reference") or nested.get("reference") or raw.get("reference") or reference)
     normalized_status = "success" if order_status in ("success", "completed", "complete", "done") else "processing"
     return status, {
@@ -2215,12 +2217,12 @@ def bay2game_create_order(product_code, player_id, server_id=""):
 def api_post_no_idempotency(path, body):
     if path == "/check_id":
         return playpay_check_id(body.get("game_id"), body.get("player_id"), body.get("server_id"), body.get("charname"))
-    return 400, {"ok": False, "error": "Bay2Game bu endpointni qo'llamaydi."}
+    return 400, {"ok": False, "error": "Bu so'rov qo'llab-quvvatlanmaydi."}
 
 
 def api_post(path, body):
     if path != "/order":
-        return 400, {"ok": False, "error": "Bay2Game endpointi topilmadi."}
+        return 400, {"ok": False, "error": "So'rov topilmadi."}
     try:
         game_id = int(body.get("game_id"))
         paket_id = int(body.get("paket_id"))
@@ -2233,11 +2235,11 @@ def api_post(path, body):
         ).fetchone()
         c.close()
         if not product or not product["provider_product_code"]:
-            return 400, {"ok": False, "error": "Bay2Game product_code topilmadi. Katalogni yangilang."}
+            return 400, {"ok": False, "error": "Mahsulot topilmadi. Keyinroq urinib ko'ring."}
         return bay2game_create_order(product["provider_product_code"], player_id, server_id)
     except Exception as exc:
         log.exception("Bay2Game order adapter xatosi")
-        return 0, {"ok": False, "error": str(exc)}
+        return 0, {"ok": False, "error": "Xatolik yuz berdi."}
 
 
 def get_playpay_order(order_id):
@@ -2536,7 +2538,7 @@ def sync_catalog():
     """Bay2Game categories va products katalogini yangilaydi."""
     categories = get_games_api()
     if not categories:
-        return False, "Bay2Game katalogi olinmadi. API key va API balansini tekshiring."
+        return False, "Katalogni yangilab bo'lmadi. Sozlamalarni tekshiring."
 
     game_count = 0
     product_count = 0
@@ -2662,8 +2664,8 @@ def sync_catalog():
                 except Exception: pass
 
     if game_count == 0:
-        return False, "Bay2Game katalogida saqlash mumkin bo'lgan o'yin topilmadi."
-    return True, f"✅ Bay2Game: {game_count} ta o'yin, {product_count} ta paket yangilandi. Kurs: 1 USD = {get_bay2game_usd_uzs():,.0f} so'm."
+        return False, "Katalogda saqlash mumkin bo'lgan o'yin topilmadi."
+    return True, f"✅ Katalog yangilandi: {game_count} ta o'yin, {product_count} ta paket. Kurs: 1 USD = {get_bay2game_usd_uzs():,.0f} so'm."
 
 
 def add_one_calendar_month(value):
@@ -4836,8 +4838,9 @@ async def text_handler(update, context):
 
         if not BAY2GAME_API_KEY:
             await update.message.reply_text(
-                "❌ BAY2GAME_API_KEY sozlanmagan. Render Environment ga Bay2Game API key kiriting."
+                "❌ Xatolik. Xizmat hozir vaqtincha ishlamayapti. Keyinroq qayta urinib ko'ring."
             )
+            await notify_bot_owner_technical(context, update.effective_user.id)
             context.user_data["state"] = None
             return
 
@@ -4854,7 +4857,7 @@ async def text_handler(update, context):
 
         if not isinstance(data, dict):
             await update.message.reply_text(
-                "❌ Bay2Game javobi noto'g'ri formatda qaytdi."
+                "❌ Xatolik. ID tekshirilmadi. Qaytadan urinib ko'ring."
             )
             context.user_data["state"] = None
             return
@@ -4894,8 +4897,8 @@ async def text_handler(update, context):
         context.user_data["state"] = None
 
         await update.message.reply_text(
-            "✅ ID qabul qilindi.\n"
-            "ℹ️ Doniz IDni oldindan tekshirmaydi; tekshiruv buyurtma yuborilganda amalga oshadi.\n\n"
+            "✅ ID formati qabul qilindi.\n"
+            "ℹ️ Hisob egasini oldindan tasdiqlash imkoni yo'q. ID buyurtma yuborilganda xizmat tomonidan tekshiriladi.\n\n"
             f"🆔 ID: <code>{html.escape(player_id)}</code>",
             parse_mode="HTML"
         )
@@ -5305,7 +5308,7 @@ async def orders_cb(update, context):
         text += (
             f"💰 {r['sale_price']:,.0f} so'm\n"
             f"📊 {r['status']}\n"
-            f"🔢 Bay2Game: "
+            f"🔢 Buyurtma raqami: "
             f"{r['playpay_order_id']}\n"
             f"🕐 {r['created_at']}\n\n"
         )
@@ -5347,10 +5350,12 @@ async def promo_cb(update, context):
 async def admin_command(update, context):
 
     set_request_db(context)
+    if update.effective_user is None or update.message is None:
+        return
     if update.effective_user.id != bot_admin_id(context):
 
         await update.message.reply_text(
-            "❌ Siz admin emassiz."
+            ""
         )
 
         return
@@ -5794,7 +5799,7 @@ async def admin_orders(update, context):
             f"💰 Sotuv: "
             f"{r['sale_price']:,.0f} so'm\n"
             f"📊 {r['status']}\n"
-            f"🔢 Bay2Game: "
+            f"🔢 Buyurtma raqami: "
             f"{r['playpay_order_id']}\n"
             f"🕐 {r['created_at']}\n\n"
         )
@@ -7438,26 +7443,29 @@ async def media_router(update, context):
 # ============================================================
 
 async def text_router(update, context):
-
+    """Route text safely; active customer order IDs take priority over stale admin states."""
     set_request_db(context)
+
     if not await child_platform_access(update, context):
         return
 
-    if update.effective_user.id == bot_admin_id(context):
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None or not getattr(message, "text", None):
+        return
 
-        handled = await admin_text_handler(
-            update,
-            context
-        )
+    # ID kiritish jarayonida adminning eski balance_user kabi holati aralashmasin.
+    # Bu, ayniqsa, bot admini o'zi buyurtma qilayotganida muhim.
+    if context.user_data.get("state") in {"player_id", "grand_player_id"}:
+        await text_handler(update, context)
+        return
 
+    if user.id == bot_admin_id(context):
+        handled = await admin_text_handler(update, context)
         if handled:
-
             return
 
-    await text_handler(
-        update,
-        context
-    )
+    await text_handler(update, context)
 
 
 # ============================================================
@@ -7467,13 +7475,15 @@ async def text_router(update, context):
 async def cancel_command(update, context):
 
     set_request_db(context)
+    if update.effective_user is None or update.message is None:
+        return
     context.user_data.clear()
 
     await update.message.reply_text(
         "❌ Bekor qilindi.",
         reply_markup=(
             admin_kb(context)
-            if update.effective_user.id == ADMIN_ID
+            if update.effective_user is not None and update.effective_user.id == ADMIN_ID
             else main_menu()
         )
     )
