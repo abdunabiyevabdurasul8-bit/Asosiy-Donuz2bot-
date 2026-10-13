@@ -1082,19 +1082,22 @@ def bot_admin_id(context):
     return child_owner_id(context.bot.id) if is_child_bot(context) else ADMIN_ID
 
 
-async def notify_bot_owner_technical(context, user_id=None):
-    """Child bot egasiga provider/API nomini ko'rsatmasdan texnik xabar yuboradi."""
+async def notify_bot_owner_technical(context, user_id=None, details=None):
+    """Bot egasiga texnik xabar yuboradi; mijozga maxfiy API tafsilotlari ko'rsatilmaydi."""
     try:
         owner_id = int(bot_admin_id(context) or 0)
         if not owner_id or (user_id is not None and int(owner_id) == int(user_id)):
             return
+        detail_text = str(details or "").strip()
+        if len(detail_text) > 700:
+            detail_text = detail_text[:700] + "..."
         await context.bot.send_message(
             chat_id=owner_id,
             text=(
-                "⚠️ Texnik nosozlik\n\n"
-                "Ulangan botda buyurtmani bajarish vaqtida muammo yuz berdi.\n"
-                "Xizmat vaqtincha ishlamayapti yoki balans yetarli emas.\n"
-                "Iltimos, tekshirib ko'ring."
+                "⚠️ Avtomatik buyurtma bajarilmadi.\n\n"
+                "Ulangan botda buyurtma API tomonidan qabul qilinmadi.\n"
+                "Balans, API kaliti, katalogdagi mahsulot kodi va Render loglarini tekshiring."
+                + (f"\n\n🔎 Xato tafsiloti: {detail_text}" if detail_text else "")
             )
         )
     except Exception:
@@ -1987,7 +1990,14 @@ def bay2game_request(path, params=None):
             status_value = str(data.get("status", "")).lower()
             explicit_failure = data.get("success") is False
             data["ok"] = (not explicit_failure) and status_value not in ("error", "failed", "failure") and not data.get("error")
-        log.info("Bay2Game %s status=%s", path, response.status_code)
+        log.info(
+            "Provider API request path=%s HTTP=%s status=%s ok=%s error=%s",
+            path,
+            response.status_code,
+            str(data.get("status", ""))[:80],
+            data.get("ok"),
+            str(data.get("error") or data.get("message") or "")[:300],
+        )
         return response.status_code, data
     except Exception as exc:
         log.exception("Bay2Game API so'rovi xatosi: %s", path)
@@ -2200,9 +2210,21 @@ def bay2game_create_order(product_code, player_id, server_id=""):
     nested = raw.get("data") if isinstance(raw.get("data"), dict) else raw
     payload = nested.get("order") if isinstance(nested.get("order"), dict) else nested
     order_status = str(payload.get("status") or nested.get("status") or raw.get("status") or "processing").lower()
-    failed = (status < 200 or status >= 300 or not raw.get("ok") or order_status in ("failed", "failure", "error"))
+    failed = (
+        status < 200 or status >= 300 or not raw.get("ok")
+        or order_status in ("failed", "failure", "error", "rejected", "cancelled")
+    )
     if failed:
-        return status, {"ok": False, "error": raw.get("error") or raw.get("message") or "Bay2Game buyurtmani qabul qilmadi.", "raw": raw}
+        error_text = str(
+            raw.get("error") or raw.get("message") or
+            nested.get("error") or nested.get("message") or
+            f"Buyurtma rad etildi (HTTP {status}, status={order_status})."
+        )
+        log.error(
+            "Avtomatik buyurtma API tomonidan rad etildi: HTTP=%s status=%s error=%s response_keys=%s",
+            status, order_status, error_text[:500], list(raw.keys())
+        )
+        return status, {"ok": False, "error": error_text, "raw": raw}
     provider_reference = str(payload.get("reference") or nested.get("reference") or raw.get("reference") or reference)
     normalized_status = "success" if order_status in ("success", "completed", "complete", "done") else "processing"
     return status, {
@@ -4051,7 +4073,11 @@ async def confirm(update, context):
             reply_markup=main_menu()
         )
 
-        await notify_bot_owner_technical(context, uid)
+        await notify_bot_owner_technical(
+            context,
+            uid,
+            details=data.get("error") or data.get("message") or f"HTTP status: {status}",
+        )
 
         return
 
