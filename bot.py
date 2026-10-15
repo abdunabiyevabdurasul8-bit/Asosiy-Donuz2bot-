@@ -1,4 +1,155 @@
 import sqlite3
+import re
+import os
+
+# PostgreSQL (Supabase) uchun moslash qatlami. Child botlar alohida SQLite faylida qoladi.
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+except ImportError:
+    psycopg2 = None
+    DictCursor = None
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+class PGCursor:
+    def __init__(self, cur, last_id=None):
+        self._cur = cur
+        self.lastrowid = last_id
+    def fetchone(self): return self._cur.fetchone()
+    def fetchall(self): return self._cur.fetchall()
+    def __iter__(self): return iter(self._cur)
+    @property
+    def rowcount(self): return self._cur.rowcount
+
+class PGConnection:
+    def __init__(self, url):
+        if not psycopg2:
+            raise RuntimeError("Render Requirements ga psycopg2-binary qo'shing")
+        self._c = psycopg2.connect(url, cursor_factory=DictCursor, connect_timeout=20)
+        self._last_id = None
+    @property
+    def row_factory(self): return None
+    @row_factory.setter
+    def row_factory(self, value): pass
+    def _sql(self, sql):
+        q = sql.strip()
+        if q.upper() == "SELECT LAST_INSERT_ROWID()":
+            return "SELECT %s AS last_insert_rowid", ("last_insert",)
+        if q.upper() == "BEGIN IMMEDIATE":
+            return "BEGIN", False
+        if q.upper().startswith("PRAGMA JOURNAL_MODE") or q.upper().startswith("PRAGMA FOREIGN_KEYS"):
+            return "SELECT 1", False
+        m = re.match(r"PRAGMA\s+table_info\(([^)]+)\)", q, re.I)
+        if m:
+            table=m.group(1).strip('"` ')
+            return ("SELECT ordinal_position AS cid, column_name AS name, data_type AS type, "
+                    "CASE WHEN is_nullable='NO' THEN 1 ELSE 0 END AS notnull, "
+                    "column_default AS dflt_value, 0 AS pk FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name=%s ORDER BY ordinal_position", ("table_info", table))
+        q = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", q, flags=re.I)
+        ignore = bool(re.search(r"INSERT\s+OR\s+IGNORE", sql, re.I))
+        replace = bool(re.search(r"INSERT\s+OR\s+REPLACE", sql, re.I))
+        q = re.sub(r"INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", q, flags=re.I)
+        if re.match(r"(CREATE|ALTER)\s+", q, re.I):
+            q = pg_schema(q)
+        q = q.replace("?", "%s")
+        if ignore and "ON CONFLICT" not in q.upper():
+            q += " ON CONFLICT DO NOTHING"
+        elif replace and "ON CONFLICT" not in q.upper():
+            mcols = re.search(r'INSERT\s+INTO\s+([\w\"]+)\s*\(([^)]+)\)', q, re.I)
+            if mcols:
+                cols=[x.strip().strip('"') for x in mcols.group(2).split(',')]
+                # For replace semantics, update every supplied column except common key columns.
+                keys={'id','user_id','game_id','paket_id','key','code','token','bot_id','country_code','invited_user_id','payment_id'}
+                upd=[x for x in cols if x.lower() not in keys]
+                if upd:
+                    q += " ON CONFLICT DO UPDATE SET " + ",".join(f'"{x}"=EXCLUDED."{x}"' for x in upd)
+                else:
+                    q += " ON CONFLICT DO NOTHING"
+        return q, False
+    def execute(self, sql, params=()):
+        query, metadata = self._sql(sql)
+        cur=self._c.cursor()
+        if isinstance(metadata, tuple) and metadata and metadata[0] == "last_insert":
+            cur.execute(query, (self._last_id,))
+            return PGCursor(cur)
+        if isinstance(metadata, tuple) and metadata and metadata[0] == "table_info":
+            cur.execute(query, (metadata[1],))
+            return PGCursor(cur)
+        # SQLite INSERT OR REPLACE uchun PostgreSQL'da PK/unique target shart.
+        # Avval eski noto'g'ri ON CONFLICT DO UPDATE qismini topib, jadval PK sini aniqlaymiz.
+        replace_match = re.search(r"\s+ON\s+CONFLICT\s+DO\s+UPDATE\s+SET\s+(.+)$", query, re.I | re.S)
+        if replace_match:
+            update_clause = replace_match.group(1).strip()
+            base_query = query[:replace_match.start()].rstrip()
+            table_match_tmp = re.match(r'\s*INSERT\s+INTO\s+([\w"]+)', base_query, re.I)
+            if table_match_tmp:
+                table_name = table_match_tmp.group(1).strip('"').split('.')[-1]
+                pk_cur = self._c.cursor()
+                pk_cur.execute("""
+                    SELECT a.attname
+                    FROM pg_index i
+                    JOIN pg_class t ON t.oid = i.indrelid
+                    JOIN pg_namespace n ON n.oid = t.relnamespace
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+                    WHERE i.indisprimary AND n.nspname = 'public' AND t.relname = %s
+                    ORDER BY array_position(i.indkey, a.attnum)
+                """, (table_name,))
+                pk_cols = [row[0] for row in pk_cur.fetchall()]
+                pk_cur.close()
+                if pk_cols:
+                    target = ", ".join('"' + col.replace('"', '""') + '"' for col in pk_cols)
+                    query = base_query + " ON CONFLICT (" + target + ") DO UPDATE SET " + update_clause
+                else:
+                    query = base_query + " ON CONFLICT DO NOTHING"
+            else:
+                query = base_query + " ON CONFLICT DO NOTHING"
+        # sqlite lastrowid replacement: ask PostgreSQL to return generated id.
+        is_insert = bool(re.match(r'\s*INSERT\s+INTO\s+([\w"]+)', query, re.I))
+        table_match = re.match(r'\s*INSERT\s+INTO\s+([\w"]+)', query, re.I)
+        has_returning = " RETURNING " in query.upper()
+        if is_insert and table_match and not has_returning and not re.search(r"ON CONFLICT DO NOTHING\s*$", query, re.I):
+            table=table_match.group(1).strip('"')
+            # Tables with generated integer ids only; other inserts need no lastrowid.
+            if table.lower() in {'payments','orders','withdrawals','balance_history','omonats','external_orders','web_auth_codes','web_orders'}:
+                query += " RETURNING id"
+        cur.execute(query, params or ())
+        last_id=None
+        if " RETURNING id" in query.upper():
+            row=cur.fetchone()
+            if row:
+                last_id=row['id']
+        if last_id is not None:
+            self._last_id = last_id
+        return PGCursor(cur, last_id)
+    def rollback(self): self._c.rollback()
+    def executescript(self, script):
+        # init_db schema statements are simple CREATE TABLE/INDEX statements.
+        cur=self._c.cursor()
+        for stmt in script.split(';'):
+            stmt=stmt.strip()
+            if stmt: cur.execute(pg_schema(stmt))
+        return PGCursor(cur)
+    def commit(self): self._c.commit()
+    def close(self): self._c.close()
+
+
+def pg_schema(sql):
+    sql=re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", sql, flags=re.I)
+    sql=re.sub(r"\bREAL\b", "DOUBLE PRECISION", sql, flags=re.I)
+    sql=re.sub(r"\bINTEGER\b", "BIGINT", sql, flags=re.I)
+    return sql
+
+def db_connect(path=None, timeout=30):
+    # Asosiy DB Supabase PostgreSQL; child bot DBlari avvalgidek SQLite.
+    if path == MAIN_DB or path is None:
+        if not DATABASE_URL:
+            raise RuntimeError("Render Environment'da DATABASE_URL yo'q")
+        return PGConnection(DATABASE_URL)
+    c=sqlite3.connect(path, timeout=timeout)
+    c.row_factory=sqlite3.Row
+    return c
 import logging
 import uuid
 import json
@@ -120,7 +271,7 @@ def set_active_db_for_bot(bot_id):
     if int(bot_id or 0) == int(MAIN_BOT_ID or 0):
         CURRENT_DB.set(MAIN_DB)
         return MAIN_DB
-    c = sqlite3.connect(MAIN_DB, timeout=30)
+    c = db_connect(MAIN_DB, timeout=30)
     c.row_factory = sqlite3.Row
     row = c.execute("SELECT db_path FROM child_bots WHERE bot_id=?", (int(bot_id),)).fetchone()
     c.close()
@@ -130,10 +281,8 @@ def set_active_db_for_bot(bot_id):
 
 
 def main_conn():
-    c = sqlite3.connect(MAIN_DB, timeout=30)
+    c = db_connect(MAIN_DB, timeout=30)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA foreign_keys=ON")
     return c
 
 # Render Web Service porti
@@ -698,20 +847,9 @@ def start_health_server():
 
 def conn():
 
-    c = sqlite3.connect(
-        active_db(),
-        timeout=30
-    )
+    c = db_connect(active_db(), timeout=30)
 
     c.row_factory = sqlite3.Row
-
-    c.execute(
-        "PRAGMA journal_mode=WAL"
-    )
-
-    c.execute(
-        "PRAGMA foreign_keys=ON"
-    )
 
     return c
 
