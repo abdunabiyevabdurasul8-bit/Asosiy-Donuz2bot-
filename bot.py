@@ -2558,13 +2558,8 @@ def sync_catalog():
 
     game_count = 0
     product_count = 0
-    c = conn()
-    try:
-        c.execute("UPDATE games SET active=0")
-        c.execute("UPDATE products SET active=0")
-        c.commit()
-    finally:
-        c.close()
+    # Katalogni yangilash mavjud o'yinlarni o'chirib qo'ymasligi kerak.
+    # API javobida vaqtincha ko'rinmay qolgan PUBG / Mobile Legends ham saqlanadi.
 
     # PUBG umumiy katalog javobida tushib qolsa, API qidiruvi orqali ham izlaymiz.
     pubg_in_catalog = any(
@@ -2626,10 +2621,7 @@ def sync_catalog():
             category.get("name") or category.get("game_name") or category.get("gameName") or
             category.get("category_name") or category.get("title") or category.get("slug") or game_code
         ).strip()
-        # PUBG Mobile Delay oddiy PUBG Mobile emas — uni foydalanuvchi katalogiga qo'shmaymiz.
-        if "pubg" in name.lower() and "delay" in name.lower():
-            log.info("PUBG Delay katalogdan o'tkazib yuborildi: %s", game_code)
-            continue
+        # API qaytargan o'yinlarni to'liq ko'rsatamiz; nomi PUBG Delay bo'lsa ham yashirmaymiz.
         # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
         region = str(category.get("region") or category.get("server") or category.get("version") or "").strip()
         if "pubg" in name.lower() and region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
