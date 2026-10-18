@@ -169,7 +169,7 @@ except Exception:
     Fernet = None
     InvalidToken = Exception
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
@@ -688,6 +688,21 @@ def web_create_order(payload, user_id):
     c.commit()
     c.close()
 
+    order_notice = (
+        f"🆕 WEB BUYURTMA #{local_id}\n\n"
+        f"📦 {product_name}\n🆔 ID: {player_id}\n"
+        f"💰 {price:,.0f} so'm\n👤 Telegram ID: {user_id}\n"
+        f"📊 {data.get('status', 'processing')}"
+    )
+    if ADMIN_ID:
+        _web_send_telegram_message(ADMIN_ID, order_notice)
+    _web_send_telegram_message(
+        user_id,
+        f"✅ Buyurtmangiz qabul qilindi!\n\n📋 Buyurtma: #{local_id}\n"
+        f"📦 {product_name}\n🆔 ID: {player_id}\n💰 {price:,.0f} so'm\n"
+        f"📊 Holat: {data.get('status', 'processing')}"
+    )
+
     return {
         "ok": True,
         "status": str(data.get("status", "processing")),
@@ -726,6 +741,18 @@ class WebAPIHandler(BaseHTTPRequestHandler):
         if h.lower().startswith("bearer "):
             return h[7:].strip()
         return ""
+
+    def do_HEAD(self):
+        from urllib.parse import urlparse
+        if urlparse(self.path).path in ("/", "/health"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", "0")
+            self._cors()
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -825,7 +852,7 @@ class HealthHandler(WebAPIHandler):
 def start_health_server():
 
     try:
-        server = HTTPServer(
+        server = ThreadingHTTPServer(
             ("0.0.0.0", PORT),
             WebAPIHandler
         )
@@ -1014,6 +1041,7 @@ def init_db():
     set_default("sim_markup_percent", SIM_MARKUP_PERCENT)
     set_default("paystars_markup_percent", PAYSTARS_MARKUP_PERCENT)
     set_default("referral_bonus_uzs", "100")
+    set_default("omonat_profit_percent", "1")
 
     if active_db() == MAIN_DB:
         c = conn()
@@ -1096,11 +1124,27 @@ def ensure_external_schema():
             for r in c.execute("PRAGMA table_info(orders)").fetchall()
         }
         additions = {
+            # Older PostgreSQL databases may have an orders table created by a previous version.
+            # Add every column used by current order flows before handlers start.
+            "user_id": "BIGINT",
+            "playpay_order_id": "TEXT DEFAULT ''",
+            "game_id": "BIGINT DEFAULT 0",
+            "paket_id": "BIGINT DEFAULT 0",
+            "product_name": "TEXT DEFAULT ''",
+            "player_id": "TEXT DEFAULT ''",
+            "fields_json": "TEXT DEFAULT '{}'",
+            "cost_usd": "DOUBLE PRECISION DEFAULT 0",
+            "charged_usd": "DOUBLE PRECISION DEFAULT 0",
+            "sale_price": "DOUBLE PRECISION DEFAULT 0",
+            "status": "TEXT DEFAULT 'pending'",
+            "created_at": "TEXT DEFAULT ''",
+            "updated_at": "TEXT DEFAULT ''",
+            "notified": "TEXT DEFAULT '0'",
             "provider": "TEXT DEFAULT 'playpay'",
             "service_type": "TEXT DEFAULT ''",
             "target": "TEXT DEFAULT ''",
-            "quantity": "REAL DEFAULT 0",
-            "months": "INTEGER DEFAULT 0",
+            "quantity": "DOUBLE PRECISION DEFAULT 0",
+            "months": "BIGINT DEFAULT 0",
             "provider_order_id": "TEXT DEFAULT ''",
         }
         for name, typ in additions.items():
@@ -1450,6 +1494,7 @@ def build_application(token, child=False):
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("omonatfoiz", omonat_foiz_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.VIDEO, media_router))
@@ -1617,49 +1662,27 @@ def ps_check_user(username, kind):
     )
 
 
-def ps_quote(username, kind, amount):
-    """PayStars'dan ayni foydalanuvchi/paket uchun jonli USD narxini oladi."""
-    if kind == "stars":
-        payload = {"kind": "stars", "username": ps_normalize_username(username), "quantity": int(amount)}
-    elif kind == "premium" and int(amount) in (3, 6, 12):
-        payload = {"kind": "premium", "username": ps_normalize_username(username), "months": int(amount)}
-    else:
-        raise ValueError("PayStars quote parametrlari noto'g'ri")
-    data = ps_post("/usd/quote", payload)
-    raw = data.get("usd")
-    if raw is None:
-        raw = (data.get("quote") or {}).get("usd") if isinstance(data.get("quote"), dict) else None
-    value = Decimal(str(raw or "0"))
-    if value <= 0:
-        raise RuntimeError("PayStars /usd/quote javobida USD narx yo'q")
-    return value
-
-
-def ps_buy_stars(username, quantity, token, max_usd, idempotency_key=None):
+def ps_buy_stars(username, quantity, token):
     return ps_post(
         "/stars/buy",
         {
             "username": username,
-            "quantity": int(quantity),
+            "quantity": quantity,
             "verification_token": token,
-            "currency": "USD",
-            "max_usd": str(max_usd),
         },
-        idempotency_key or ("stars_" + str(uuid.uuid4())),
+        "stars_" + str(uuid.uuid4()),
     )
 
 
-def ps_buy_premium(username, months, token, max_usd, idempotency_key=None):
+def ps_buy_premium(username, months, token):
     return ps_post(
         "/premium/buy",
         {
             "username": username,
-            "months": int(months),
+            "months": months,
             "verification_token": token,
-            "currency": "USD",
-            "max_usd": str(max_usd),
         },
-        idempotency_key or ("premium_" + str(uuid.uuid4())),
+        "premium_" + str(uuid.uuid4()),
     )
 
 
@@ -1669,13 +1692,7 @@ def ps_sell(value, kind="stars"):
         markup = Decimal(str(get_setting(key, PAYSTARS_MARKUP_PERCENT)))
     except Exception:
         markup = PAYSTARS_MARKUP_PERCENT
-    # API narxi USD'da; foydalanuvchi balansi so'mda. Botdagi mavjud admin kursidan foydalanamiz.
-    try:
-        usd_uzs = Decimal(str(get_bay2game_usd_uzs()))
-    except Exception:
-        usd_uzs = Decimal("13000")
-    result = Decimal(str(value)) * usd_uzs * (Decimal("1") + markup / Decimal("100"))
-    return float(result.quantize(Decimal("1")))
+    return round(float(value) * (1 + float(markup) / 100), 2)
 
 
 def ps_pricing():
@@ -1759,13 +1776,22 @@ def paystars_kb():
 
 async def paystars_menu(update, context):
     q = update.callback_query
-    # Narxlar o'zgaruvchan: paket va username ma'lum bo'lgach /usd/quote orqali olinadi.
-    text = (
-        "⭐ <b>Telegram xizmatlari</b>\n\n"
-        "⭐ Telegram Stars — minimal 50\n"
-        "💎 Telegram Premium — 3, 6 yoki 12 oy\n\n"
-        "💵 Narx API'dan buyurtma oldidan olinadi."
-    )
+    try:
+        p = await asyncio.to_thread(ps_pricing)
+        star = ps_sell(p.get("star_price", 0), "stars")
+        p3 = ps_sell(p.get("premium_3_price", 0), "premium")
+        p6 = ps_sell(p.get("premium_6_price", 0), "premium")
+        p12 = ps_sell(p.get("premium_12_price", 0), "premium")
+        text = (
+            "⭐ <b>Telegram xizmatlari</b>\n\n"
+            f"⭐ 1 Stars: {star:,.0f} so'm\n"
+            "⭐ Minimal: 50 Stars\n\n"
+            f"💎 Premium 3 oy: {p3:,.0f} so'm\n"
+            f"💎 Premium 6 oy: {p6:,.0f} so'm\n"
+            f"💎 Premium 12 oy: {p12:,.0f} so'm"
+        )
+    except Exception:
+        text = "⭐ Telegram Stars va 💎 Telegram Premium"
     await q.message.reply_text(text, parse_mode="HTML", reply_markup=paystars_kb())
 
 
@@ -1836,14 +1862,10 @@ async def ps_confirm(update, context, kind):
 
     add_balance(uid, -price, "purchase", f"PayStars {label}")
     try:
-        quote_usd = context.user_data.get("ps_quote_usd")
-        idempotency_key = context.user_data.get("ps_idempotency_key")
-        if not quote_usd or not idempotency_key:
-            raise RuntimeError("PayStars quote/idempotency ma'lumoti topilmadi")
         result = await asyncio.to_thread(
-            ps_buy_stars, username, quantity, token, quote_usd, idempotency_key
+            ps_buy_stars, username, quantity, token
         ) if kind == "stars" else await asyncio.to_thread(
-            ps_buy_premium, username, months, token, quote_usd, idempotency_key
+            ps_buy_premium, username, months, token
         )
         oid = str(result.get("order_id", ""))
         status = str(result.get("status", "processing"))
@@ -1863,11 +1885,20 @@ async def ps_confirm(update, context, kind):
             f"📊 {status}",
             parse_mode="HTML"
         )
+        try:
+            await context.bot.send_message(
+                chat_id=bot_admin_id(context),
+                text=(f"🆕 YANGI TELEGRAM BUYURTMA\n\n{label}\n"
+                      f"👤 @{username}\n🆔 User ID: {uid}\n"
+                      f"💰 {price:,.0f} so'm\n📦 Buyurtma ID: {oid}\n📊 {status}")
+            )
+        except Exception:
+            log.exception("Stars/Premium buyurtmasi haqida adminga xabar yuborilmadi")
         context.user_data.clear()
     except Exception as e:
-        log.warning("PayStars %s buy failed for user %s: %s", kind, uid, e)
+        log.exception("PayStars %s buy failed", kind)
         add_balance(uid, price, "refund", f"PayStars {label} refund")
-        await notify_bot_owner_technical(context, uid)
+        await notify_bot_owner_technical(context, uid, str(e))
         await q.message.reply_text(
             "❌ Buyurtmani bajarib bo'lmadi.\n\n"
             "🛠 Texnik nosozlik. Birozdan keyin qayta urinib ko'ring.\n"
@@ -2888,7 +2919,7 @@ def process_due_omonats(notify=True):
             c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (total, row["user_id"]))
             c.execute(
                 "INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)",
-                (row["user_id"], total, "omonat_maturity", f"Omonat #{oid}: asosiy summa va 1% foyda", now.isoformat())
+                (row["user_id"], total, "omonat_maturity", f"Omonat #{oid}: asosiy summa va foyda", now.isoformat())
             )
             c.execute(
                 "UPDATE omonats SET status='matured', paid_at=?, closed_at=? WHERE id=? AND status='active'",
@@ -2904,7 +2935,7 @@ def process_due_omonats(notify=True):
                             "text": (
                                 f"🏦 Omonat #{oid} muddati tugadi!\n\n"
                                 f"💰 Omonat: {float(row['principal']):,.0f} so'm\n"
-                                f"📈 Foyda (1%): {float(row['profit']):,.0f} so'm\n"
+                                f"📈 Foyda: {float(row['profit']):,.0f} so'm\n"
                                 f"✅ Balansga qaytarildi: {total:,.0f} so'm"
                             )
                         }, timeout=10
@@ -2941,7 +2972,7 @@ async def omonat_menu(update, context):
     c.close()
     await q.message.reply_text(
         "🏦 OMONAT\n\n"
-        "📈 Oylik foyda: 1%\n"
+        f"📈 Oylik foyda: {get_setting('omonat_profit_percent', '1')}%\n"
         "🗓 Muddat: 1 kalendar oy\n"
         "⏰ Foyda omonat ochilgan vaqtga mos ravishda bir oy o'tgach hisoblanadi.\n"
         "✅ Muddat tugaganda asosiy summa va foyda balansga bir marta qaytariladi.\n"
@@ -3012,7 +3043,7 @@ async def omonat_close_prompt(update, context, omonat_id):
     await q.message.reply_text(
         f"⚠️ #{omonat_id} omonatni muddatidan oldin yopmoqchimisiz?\n\n"
         f"💰 Qaytariladigan asosiy summa: {float(row['principal']):,.0f} so'm\n"
-        "📉 Muddatidan oldin yopilgani uchun 1% foyda berilmaydi.\n\n"
+        "📉 Muddatidan oldin yopilgani uchun foyda berilmaydi.\n\n"
         "Yopishni tasdiqlaysizmi?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Ha, yopish", callback_data=f"omonat_close_yes_{omonat_id}")],
@@ -4446,6 +4477,11 @@ async def confirm(update, context):
                 """,
                 (promo,)
             )
+            # Once the configured total-use limit is reached, deactivate the code.
+            c.execute(
+                "UPDATE promo_codes SET active=0 WHERE code=? AND max_uses>0 AND used>=max_uses",
+                (promo,)
+            )
 
         c.commit()
         c.close()
@@ -4670,13 +4706,11 @@ async def text_handler(update, context):
             await update.message.reply_text("❌ Minimal 50 Stars.")
             return
         try:
-            quote_usd = await asyncio.to_thread(ps_quote, context.user_data.get("ps_username"), "stars", quantity)
-            price = ps_sell(quote_usd, "stars")
+            pricing = await asyncio.to_thread(ps_pricing)
+            price = ps_sell(float(pricing.get("star_price", 0)) * quantity, "stars")
             if price <= 0:
-                raise RuntimeError("PayStars quote narxi noto'g'ri")
+                raise RuntimeError
             context.user_data["ps_quantity"] = quantity
-            context.user_data["ps_quote_usd"] = str(quote_usd)
-            context.user_data["ps_idempotency_key"] = "stars_" + str(uuid.uuid4())
             context.user_data["ps_price"] = price
             context.user_data["state"] = None
             await update.message.reply_text(
@@ -4714,14 +4748,12 @@ async def text_handler(update, context):
             token = r.get("verification_token")
             if not token:
                 raise RuntimeError("Verification token qaytmadi")
-            quote_usd = await asyncio.to_thread(ps_quote, r.get("username") or name, "premium", months)
-            price = ps_sell(quote_usd, "premium")
+            pricing = await asyncio.to_thread(ps_pricing)
+            price = ps_sell(float(pricing.get(f"premium_{months}_price", 0)), "premium")
             if price <= 0:
-                raise RuntimeError("PayStars quote narxi noto'g'ri")
-            context.user_data["ps_username"] = r.get("username") or name
+                raise RuntimeError
+            context.user_data["ps_username"] = name
             context.user_data["ps_token"] = r.get("verification_token")
-            context.user_data["ps_quote_usd"] = str(quote_usd)
-            context.user_data["ps_idempotency_key"] = "premium_" + str(uuid.uuid4())
             context.user_data["ps_price"] = price
             context.user_data["state"] = None
             await update.message.reply_text(
@@ -4806,7 +4838,11 @@ async def text_handler(update, context):
             return
         started = datetime.now()
         matures = add_one_calendar_month(started)
-        profit = (amount * Decimal("0.01")).quantize(Decimal("1"))
+        try:
+            profit_percent = Decimal(str(get_setting("omonat_profit_percent", "1")))
+        except Exception:
+            profit_percent = Decimal("1")
+        profit = (amount * profit_percent / Decimal("100")).quantize(Decimal("1"))
         c = main_conn()
         try:
             c.execute("BEGIN IMMEDIATE")
@@ -4831,7 +4867,7 @@ async def text_handler(update, context):
         await update.message.reply_text(
             f"✅ Omonat #{omonat_id} ochildi!\n\n"
             f"💰 Summa: {amount:,.0f} so'm\n"
-            f"📈 1% foyda: {profit:,.0f} so'm\n"
+            f"📈 {profit_percent}% foyda: {profit:,.0f} so'm\n"
             f"💵 Muddat tugaganda jami: {amount + profit:,.0f} so'm\n"
             f"🗓 Ochilgan: {started.strftime('%d.%m.%Y %H:%M:%S')}\n"
             f"⏰ Tugash vaqti: {matures.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
@@ -5545,6 +5581,31 @@ async def promo_cb(update, context):
 # ============================================================
 # ADMIN COMMAND
 # ============================================================
+
+async def omonat_foiz_command(update, context):
+    """Admin: /omonatfoiz 2.5 — yangi omonatlar uchun oylik foiz."""
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        current = get_setting("omonat_profit_percent", "1")
+        await update.message.reply_text(
+            f"Hozirgi omonat foizi: {current}%\n"
+            "O'zgartirish: /omonatfoiz 2.5\n"
+            "Yangi foiz faqat keyin ochiladigan omonatlarga ta'sir qiladi."
+        )
+        return
+    try:
+        rate = Decimal(context.args[0].replace(",", "."))
+    except Exception:
+        return await update.message.reply_text("Foizni raqamda kiriting. Masalan: /omonatfoiz 2.5")
+    if rate < 0 or rate > 100:
+        return await update.message.reply_text("Foiz 0 dan 100 gacha bo'lishi kerak.")
+    set_setting("omonat_profit_percent", str(rate.normalize()))
+    await update.message.reply_text(
+        f"✅ Omonat foizi saqlandi: {rate.normalize()}%\n"
+        "Bu sozlama yangi omonatlarga qo'llanadi."
+    )
+
 
 async def admin_command(update, context):
 
@@ -6915,6 +6976,7 @@ async def check_orders(context):
         ('processing','pending')
           AND playpay_order_id IS NOT NULL
           AND playpay_order_id!=''
+          AND COALESCE(provider,'bay2game') NOT IN ('paystars')
         ORDER BY id ASC
         LIMIT 30
         """
