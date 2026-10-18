@@ -2584,8 +2584,9 @@ def sync_catalog():
         for item in categories
     ):
         for search_term in ("pubg global", "pubg"):
-          for path in ("/categories", "/games"):
-            st, response = bay2game_request(path, {"search": search_term, "q": search_term})
+            # API logida /games 404 qaytargani uchun faqat mavjudligi tasdiqlangan
+            # /categories endpointidan foydalanamiz; noma'lum endpointni chaqirmaymiz.
+            st, response = bay2game_request("/categories", {"search": search_term, "q": search_term})
             if st and response.get("ok"):
                 options = []
                 for key in ("categories", "games", "items", "results", "data"):
@@ -2607,8 +2608,11 @@ def sync_catalog():
                 if pubg_options:
                     categories.extend(pubg_options)
                     break
-          if any("global" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower() for x in categories if isinstance(x, dict)):
-            break
+            if search_term == "pubg" and any(
+                "global" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()
+                for x in categories if isinstance(x, dict)
+            ):
+                break
 
     for category in categories:
         if not isinstance(category, dict):
