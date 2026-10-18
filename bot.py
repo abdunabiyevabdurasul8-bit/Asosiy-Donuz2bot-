@@ -169,7 +169,7 @@ except Exception:
     Fernet = None
     InvalidToken = Exception
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
@@ -825,10 +825,10 @@ class HealthHandler(WebAPIHandler):
 def start_health_server():
 
     try:
-        server = HTTPServer(
-            ("0.0.0.0", PORT),
-            WebAPIHandler
-        )
+        server = ThreadingHTTPServer(
+    ("0.0.0.0", PORT),
+    WebAPIHandler
+)
 
         log.info(
             "Render Web/API server ishga tushdi: 0.0.0.0:%s",
