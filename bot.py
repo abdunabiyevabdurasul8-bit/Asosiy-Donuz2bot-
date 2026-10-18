@@ -732,6 +732,21 @@ class WebAPIHandler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def do_HEAD(self):
+        # UptimeRobot yoki boshqa monitor HEAD yuborsa ham 501 qaytarmasin.
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path
+        if path in ("/", "/health"):
+            raw = _json_bytes({"ok": True, "service": "GAME DONAT", "status": "online"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self._cors()
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def do_GET(self):
         from urllib.parse import urlparse
 
@@ -826,9 +841,9 @@ def start_health_server():
 
     try:
         server = ThreadingHTTPServer(
-    ("0.0.0.0", PORT),
-    WebAPIHandler
-)
+            ("0.0.0.0", PORT),
+            WebAPIHandler
+        )
 
         log.info(
             "Render Web/API server ishga tushdi: 0.0.0.0:%s",
@@ -1014,6 +1029,7 @@ def init_db():
     set_default("sim_markup_percent", SIM_MARKUP_PERCENT)
     set_default("paystars_markup_percent", PAYSTARS_MARKUP_PERCENT)
     set_default("referral_bonus_uzs", "100")
+    set_default("omonat_percent", "1")
 
     if active_db() == MAIN_DB:
         c = conn()
@@ -1096,6 +1112,20 @@ def ensure_external_schema():
             for r in c.execute("PRAGMA table_info(orders)").fetchall()
         }
         additions = {
+            # Eski PostgreSQL bazalarida orders.playpay_order_id bo'lmasligi mumkin.
+            "playpay_order_id": "TEXT DEFAULT ''",
+            "game_id": "INTEGER DEFAULT 0",
+            "paket_id": "INTEGER DEFAULT 0",
+            "product_name": "TEXT DEFAULT ''",
+            "player_id": "TEXT DEFAULT ''",
+            "fields_json": "TEXT DEFAULT '{}'",
+            "cost_usd": "REAL DEFAULT 0",
+            "charged_usd": "REAL DEFAULT 0",
+            "sale_price": "REAL DEFAULT 0",
+            "status": "TEXT DEFAULT 'pending'",
+            "created_at": "TEXT DEFAULT ''",
+            "updated_at": "TEXT DEFAULT ''",
+            "notified": "TEXT DEFAULT '0'",
             "provider": "TEXT DEFAULT 'playpay'",
             "service_type": "TEXT DEFAULT ''",
             "target": "TEXT DEFAULT ''",
@@ -2840,8 +2870,15 @@ def add_one_calendar_month(value):
     return value.replace(year=year, month=month, day=day)
 
 
+def get_omonat_percent():
+    try:
+        return max(0.0, min(100.0, float(get_setting("omonat_percent", "1"))))
+    except Exception:
+        return 1.0
+
+
 def process_due_omonats(notify=True):
-    """Muddat yetgan omonatni bir marta yopib, asosiy summa + 1% foydani qaytaradi."""
+    """Muddat yetgan omonatni bir marta yopib, asosiy summa + saqlangan foydani qaytaradi."""
     now = datetime.now()
     due_ids = []
     c = main_conn()
@@ -2917,7 +2954,7 @@ async def omonat_menu(update, context):
     c.close()
     await q.message.reply_text(
         "🏦 OMONAT\n\n"
-        "📈 Oylik foyda: 1%\n"
+        f"📈 Oylik foyda: {get_omonat_percent():g}%\n"
         "🗓 Muddat: 1 kalendar oy\n"
         "⏰ Foyda omonat ochilgan vaqtga mos ravishda bir oy o'tgach hisoblanadi.\n"
         "✅ Muddat tugaganda asosiy summa va foyda balansga bir marta qaytariladi.\n"
@@ -3166,6 +3203,7 @@ def main_menu():
         [InlineKeyboardButton("💳 Balans to'ldirish", callback_data="deposit")],
         [InlineKeyboardButton("💸 Pul o'tkazish", callback_data="transfer_start")],
         [InlineKeyboardButton("🏦 Omonat", callback_data="omonat")],
+        [InlineKeyboardButton("🏆 Reyting", callback_data="rating_menu")],
         [InlineKeyboardButton("💸 Balans yechish", callback_data="withdraw")],
         [InlineKeyboardButton("🔗 Referal", callback_data="referral")],
         [InlineKeyboardButton("📦 Buyurtmalarim", callback_data="orders")],
@@ -3211,6 +3249,7 @@ def admin_kb(context=None):
             InlineKeyboardButton("📱 SIM ustama", callback_data="adm_markup_sim")
         ],
         [InlineKeyboardButton("🔗 Referal bonusini sozlash", callback_data="adm_referral_bonus")],
+        [InlineKeyboardButton("🏦 Omonat foizini sozlash", callback_data="adm_omonat_percent")],
         [
             InlineKeyboardButton("⭐ Stars ustama", callback_data="adm_markup_stars"),
             InlineKeyboardButton("💎 Premium ustama", callback_data="adm_markup_premium")
@@ -6640,6 +6679,20 @@ async def admin_text_handler(update, context):
     # PROMO ADMIN
     # ========================================================
 
+    if state == "admin_omonat_percent":
+        if message.from_user.id != bot_admin_id(context):
+            return
+        try:
+            percent = float((message.text or "").strip().replace(",", "."))
+            if not 0 <= percent <= 100:
+                raise ValueError
+            set_setting("omonat_percent", str(percent))
+            context.user_data.pop("state", None)
+            await message.reply_text(f"✅ Omonat foizi {percent:g}% qilib saqlandi.", reply_markup=main_menu())
+        except Exception:
+            await message.reply_text("❌ 0 dan 100 gacha son yuboring.")
+        return
+
     if state == "promo_admin":
 
         parts = text.split()
@@ -6961,14 +7014,15 @@ async def check_orders(context):
 async def rating_callback(update, context):
 
     q = update.callback_query
+    # Reyting hammaga ochiq; admin huquqi talab qilinmaydi.
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
-    if q.from_user.id != bot_admin_id(context):
-
-        return
-
-    period = q.data.split(
-        ":"
-    )[1]
+    period = q.data.split(":")[-1]
+    if period not in ("week", "month"):
+        period = "week"
 
     days = (
         7
@@ -7167,6 +7221,14 @@ async def admin_callback(update, context):
                     )
                 ]
             ])
+        )
+
+    elif d == "adm_omonat_percent":
+        if q.from_user.id != bot_admin_id(context):
+            return await q.answer("Ruxsat yo'q", show_alert=True)
+        context.user_data["state"] = "admin_omonat_percent"
+        await q.message.reply_text(
+            f"Hozirgi omonat foizi: {get_omonat_percent():g}%\nYangi oylik foizni yuboring (0–100)."
         )
 
     elif d == "adm_users":
@@ -7528,6 +7590,16 @@ async def callback_router(update, context):
             await payment_action(
                 update,
                 context
+            )
+
+        elif d == "rating_menu":
+            await q.message.reply_text(
+                "🏆 Reyting davrini tanlang:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📅 1 haftalik", callback_data="rating:week")],
+                    [InlineKeyboardButton("🗓 1 oylik", callback_data="rating:month")],
+                    [InlineKeyboardButton("⬅️ Asosiy menyu", callback_data="back_home")],
+                ])
             )
 
         elif d.startswith("rating:"):
