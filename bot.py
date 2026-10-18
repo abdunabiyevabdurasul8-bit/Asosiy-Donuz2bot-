@@ -1538,7 +1538,7 @@ async def admin_bot_detail(update, context, bot_id):
 
 
 # ============================================================
-# LEGACY PAYSTARS API (Stars/Premium savdosi Bay2Game katalogidan olinadi)
+# PAYSTARS API
 # ============================================================
 def ps_headers(idempotency_key=None):
     h = {
@@ -1617,27 +1617,49 @@ def ps_check_user(username, kind):
     )
 
 
-def ps_buy_stars(username, quantity, token):
+def ps_quote(username, kind, amount):
+    """PayStars'dan ayni foydalanuvchi/paket uchun jonli USD narxini oladi."""
+    if kind == "stars":
+        payload = {"kind": "stars", "username": ps_normalize_username(username), "quantity": int(amount)}
+    elif kind == "premium" and int(amount) in (3, 6, 12):
+        payload = {"kind": "premium", "username": ps_normalize_username(username), "months": int(amount)}
+    else:
+        raise ValueError("PayStars quote parametrlari noto'g'ri")
+    data = ps_post("/usd/quote", payload)
+    raw = data.get("usd")
+    if raw is None:
+        raw = (data.get("quote") or {}).get("usd") if isinstance(data.get("quote"), dict) else None
+    value = Decimal(str(raw or "0"))
+    if value <= 0:
+        raise RuntimeError("PayStars /usd/quote javobida USD narx yo'q")
+    return value
+
+
+def ps_buy_stars(username, quantity, token, max_usd, idempotency_key=None):
     return ps_post(
         "/stars/buy",
         {
             "username": username,
-            "quantity": quantity,
+            "quantity": int(quantity),
             "verification_token": token,
+            "currency": "USD",
+            "max_usd": str(max_usd),
         },
-        "stars_" + str(uuid.uuid4()),
+        idempotency_key or ("stars_" + str(uuid.uuid4())),
     )
 
 
-def ps_buy_premium(username, months, token):
+def ps_buy_premium(username, months, token, max_usd, idempotency_key=None):
     return ps_post(
         "/premium/buy",
         {
             "username": username,
-            "months": months,
+            "months": int(months),
             "verification_token": token,
+            "currency": "USD",
+            "max_usd": str(max_usd),
         },
-        "premium_" + str(uuid.uuid4()),
+        idempotency_key or ("premium_" + str(uuid.uuid4())),
     )
 
 
@@ -1647,7 +1669,13 @@ def ps_sell(value, kind="stars"):
         markup = Decimal(str(get_setting(key, PAYSTARS_MARKUP_PERCENT)))
     except Exception:
         markup = PAYSTARS_MARKUP_PERCENT
-    return round(float(value) * (1 + float(markup) / 100), 2)
+    # API narxi USD'da; foydalanuvchi balansi so'mda. Botdagi mavjud admin kursidan foydalanamiz.
+    try:
+        usd_uzs = Decimal(str(get_bay2game_usd_uzs()))
+    except Exception:
+        usd_uzs = Decimal("13000")
+    result = Decimal(str(value)) * usd_uzs * (Decimal("1") + markup / Decimal("100"))
+    return float(result.quantize(Decimal("1")))
 
 
 def ps_pricing():
@@ -1713,56 +1741,6 @@ def save_external_order(
 
 
 # ============================================================
-# BAY2GAME TELEGRAM STARS / PREMIUM KATALOGI
-# Mahsulot va narx faqat admin yangilaydigan Bay2Game katalogidan olinadi.
-# ============================================================
-def find_bay2game_telegram_product(kind, amount):
-    """Bay2Game katalogida Stars miqdori yoki Premium oyi mos paketni topadi."""
-    c = conn()
-    try:
-        rows = c.execute(
-            """SELECT p.game_id, p.paket_id, p.game_name, p.package_name,
-                      p.sale_price, p.provider_product_code, g.name AS catalog_game
-               FROM products p JOIN games g ON g.game_id=p.game_id
-               WHERE p.active=1 AND g.active=1
-                 AND COALESCE(p.provider_product_code,'')<>''
-               ORDER BY p.game_name, p.package_name"""
-        ).fetchall()
-    finally:
-        c.close()
-
-    wanted = int(amount)
-    for row in rows:
-        game_name = str(row["catalog_game"] or row["game_name"] or "").lower()
-        package = str(row["package_name"] or "").lower()
-        combined = game_name + " " + package
-        # Avoid unrelated products that happen to contain 'star' or 'premium'.
-        if kind == "stars":
-            if not ("star" in game_name or "telegram" in game_name) or "premium" in combined:
-                continue
-            if not ("star" in combined or "telegram" in combined):
-                continue
-            nums = [int(x) for x in re.findall(r"(?<!\d)\d+(?!\d)", package)]
-            if wanted not in nums:
-                continue
-        else:
-            if "premium" not in combined or "telegram" not in combined:
-                continue
-            nums = [int(x) for x in re.findall(r"(?<!\d)\d+(?!\d)", package)]
-            if wanted not in nums:
-                continue
-        try:
-            price = Decimal(str(row["sale_price"] or 0))
-        except Exception:
-            continue
-        if price > 0:
-            return {"product_code": str(row["provider_product_code"]),
-                    "name": str(row["package_name"] or row["game_name"]),
-                    "price": price}
-    return None
-
-
-# ============================================================
 # PAYSTARS UI / FLOW
 # ============================================================
 def paystars_kb():
@@ -1781,12 +1759,14 @@ def paystars_kb():
 
 async def paystars_menu(update, context):
     q = update.callback_query
-    await q.message.reply_text(
+    # Narxlar o'zgaruvchan: paket va username ma'lum bo'lgach /usd/quote orqali olinadi.
+    text = (
         "⭐ <b>Telegram xizmatlari</b>\n\n"
-        "Paketlar va narxlar Bay2Game katalogidan olinadi.\n"
-        "Agar kerakli paket ko'rinmasa, admin 🔄 Katalog tugmasi orqali katalogni yangilasin.",
-        parse_mode="HTML", reply_markup=paystars_kb()
+        "⭐ Telegram Stars — minimal 50\n"
+        "💎 Telegram Premium — 3, 6 yoki 12 oy\n\n"
+        "💵 Narx API'dan buyurtma oldidan olinadi."
     )
+    await q.message.reply_text(text, parse_mode="HTML", reply_markup=paystars_kb())
 
 
 async def ps_stars_start(update, context):
@@ -1826,55 +1806,72 @@ async def ps_premium_month(update, context):
 async def ps_confirm(update, context, kind):
     q = update.callback_query
     uid = q.from_user.id
-    username = str(context.user_data.get("ps_username") or "").strip().lstrip("@")
-    quantity = int(context.user_data.get("ps_quantity", 0) or 0) if kind == "stars" else 0
-    months = int(context.user_data.get("ps_months", 0) or 0) if kind == "premium" else 0
-    product_code = str(context.user_data.get("ps_product_code") or "").strip()
-    try:
-        price = Decimal(str(context.user_data.get("ps_price", 0) or 0))
-    except Exception:
-        price = Decimal("0")
-    label = f"⭐ {quantity} Stars" if kind == "stars" else f"💎 Premium {months} oy"
+    if kind == "stars":
+        username = context.user_data.get("ps_username")
+        quantity = int(context.user_data.get("ps_quantity", 0))
+        months = 0
+        token = context.user_data.get("ps_token")
+        price = float(context.user_data.get("ps_price", 0))
+        label = f"⭐ {quantity} Stars"
+    else:
+        username = context.user_data.get("ps_username")
+        quantity = 0
+        months = int(context.user_data.get("ps_months", 0))
+        token = context.user_data.get("ps_token")
+        price = float(context.user_data.get("ps_price", 0))
+        label = f"💎 Premium {months} oy"
 
-    if not username or not product_code or price <= 0:
-        await q.message.reply_text(
-            "❌ Buyurtma ma'lumotlari topilmadi. Bay2Game katalogini yangilang va qayta urinib ko'ring."
-        )
+    if not username or not token or price <= 0:
+        await q.message.reply_text("❌ Buyurtma ma'lumotlari eskirgan.")
         context.user_data.clear()
         return
-    if get_balance(uid) < price:
+
+    if get_balance(uid) < Decimal(str(price)):
         await q.message.reply_text(
-            f"❌ Balans yetarli emas.\nKerak: {price:,.0f} so'm\n"
+            f"❌ Balans yetarli emas.\n"
+            f"Kerak: {price:,.0f} so'm\n"
             f"Balans: {get_balance(uid):,.0f} so'm"
         )
         return
 
-    # Balans faqat buyurtma API'ga yuborilishidan oldin vaqtincha yechiladi;
-    # API xato qaytarsa to'liq qaytariladi.
-    add_balance(uid, -price, "purchase", f"Bay2Game {label}")
+    add_balance(uid, -price, "purchase", f"PayStars {label}")
     try:
-        status, result = await asyncio.to_thread(bay2game_create_order, product_code, username)
-        if not result.get("ok"):
-            raise RuntimeError(str(result.get("error") or "Bay2Game buyurtmani qabul qilmadi"))
-        oid = str(result.get("order_id") or result.get("reference") or "")
+        quote_usd = context.user_data.get("ps_quote_usd")
+        idempotency_key = context.user_data.get("ps_idempotency_key")
+        if not quote_usd or not idempotency_key:
+            raise RuntimeError("PayStars quote/idempotency ma'lumoti topilmadi")
+        result = await asyncio.to_thread(
+            ps_buy_stars, username, quantity, token, quote_usd, idempotency_key
+        ) if kind == "stars" else await asyncio.to_thread(
+            ps_buy_premium, username, months, token, quote_usd, idempotency_key
+        )
+        oid = str(result.get("order_id", ""))
+        status = str(result.get("status", "processing"))
         if not oid:
-            raise RuntimeError("Bay2Game order ID qaytarmadi")
-        save_external_order(uid, "bay2game", kind, oid, username,
-                            quantity, months, float(price), str(result.get("status") or "processing"))
+            raise RuntimeError("PayStars order_id qaytarmadi")
+
+        save_external_order(
+            uid, "paystars", kind, oid, username,
+            quantity, months, price, status
+        )
         await q.message.reply_text(
-            f"✅ <b>Buyurtma Bay2Game'ga yuborildi!</b>\n\n"
-            f"🆔 <code>{oid}</code>\n👤 @{username}\n{label}\n"
-            f"💰 {price:,.0f} so'm\n📊 {result.get('status', 'processing')}",
+            f"✅ <b>Buyurtma qabul qilindi!</b>\n\n"
+            f"🆔 <code>{oid}</code>\n"
+            f"👤 @{username}\n"
+            f"{label}\n"
+            f"💰 {price:,.0f} so'm\n"
+            f"📊 {status}",
             parse_mode="HTML"
         )
         context.user_data.clear()
     except Exception as e:
-        log.exception("Bay2Game Telegram %s order failed: %s", kind, str(e)[:300])
-        add_balance(uid, price, "refund", f"Bay2Game {label} refund")
+        log.warning("PayStars %s buy failed for user %s: %s", kind, uid, e)
+        add_balance(uid, price, "refund", f"PayStars {label} refund")
         await notify_bot_owner_technical(context, uid)
         await q.message.reply_text(
-            "❌ Bay2Game buyurtmani bajara olmadi.\n\n"
-            "💰 Balansingiz qaytarildi. Katalog va mahsulot mavjudligini tekshirib, qayta urinib ko'ring."
+            "❌ Buyurtmani bajarib bo'lmadi.\n\n"
+            "🛠 Texnik nosozlik. Birozdan keyin qayta urinib ko'ring.\n"
+            "💰 Balansingiz qaytarildi."
         )
         context.user_data.clear()
 
@@ -4626,18 +4623,41 @@ async def text_handler(update, context):
         return
 
     # ========================================================
-    # BAY2GAME: TELEGRAM STARS / PREMIUM
+    # PAYSTARS: STARS USERNAME
     # ========================================================
     if state == "ps_stars_username":
-        name = text.strip().lstrip("@")
+        name = text.lstrip("@")
         if not name or " " in name or len(name) > 64:
             await update.message.reply_text("❌ Username noto'g'ri. Masalan: @username")
             return
-        context.user_data["ps_username"] = name
-        context.user_data["state"] = "ps_stars_quantity"
-        await update.message.reply_text(
-            "⭐ Nechta Stars kerak?\nMiqdorni yuboring. Paket Bay2Game katalogida bo'lishi shart."
-        )
+        try:
+            if not PAYSTARS_API_KEY:
+                raise RuntimeError("PAYSTARS_API_KEY sozlanmagan")
+            r = await asyncio.to_thread(ps_check_user, name, "stars")
+            if not r.get("valid"):
+                reason = r.get("detail") or r.get("message") or "Bu username Stars uchun yaroqsiz."
+                raise RuntimeError(str(reason)[:250])
+            token = r.get("verification_token")
+            if not token:
+                raise RuntimeError("Verification token qaytmadi")
+            context.user_data["ps_username"] = r.get("username") or name
+            context.user_data["ps_token"] = token
+            context.user_data["state"] = "ps_stars_quantity"
+            nickname = r.get("nickname")
+            extra = f"\n👤 {nickname}" if nickname else ""
+            await update.message.reply_text(f"✅ Username tasdiqlandi: @{context.user_data['ps_username']}{extra}\n\n🔢 Nechta Stars?\n\nMinimal: 50")
+        except Exception as e:
+            log.warning("PayStars Stars username check failed: %s", e)
+            msg = str(e)
+            if "401" in msg or "403" in msg or "API_KEY" in msg:
+                user_msg = "❌ Xizmat hozircha ishlamayapti.\n\n🛠 Texnik nosozlik."
+            elif "422" in msg:
+                user_msg = "❌ Username topilmadi yoki Stars uchun mavjud emas."
+            elif "429" in msg:
+                user_msg = "❌ Juda ko'p tekshiruv. Birozdan keyin qayta urinib ko'ring."
+            else:
+                user_msg = "❌ Username tekshirishda texnik nosozlik yuz berdi.\n\n🛠 Keyinroq qayta urinib ko'ring."
+            await update.message.reply_text(user_msg)
         return
 
     if state == "ps_stars_quantity":
@@ -4646,66 +4666,88 @@ async def text_handler(update, context):
         except Exception:
             await update.message.reply_text("❌ Faqat son yuboring.")
             return
-        if quantity < 1:
-            await update.message.reply_text("❌ Miqdor musbat son bo'lishi kerak.")
+        if quantity < 50:
+            await update.message.reply_text("❌ Minimal 50 Stars.")
             return
         try:
-            product = await asyncio.to_thread(find_bay2game_telegram_product, "stars", quantity)
-            if not product:
-                await update.message.reply_text(
-                    "❌ Bu miqdordagi Stars Bay2Game katalogida topilmadi.\n"
-                    "Admin 🔄 Katalog tugmasini yangilasin yoki katalogdagi mavjud paketni tanlang."
-                )
-                return
-            price = product["price"]
+            quote_usd = await asyncio.to_thread(ps_quote, context.user_data.get("ps_username"), "stars", quantity)
+            price = ps_sell(quote_usd, "stars")
+            if price <= 0:
+                raise RuntimeError("PayStars quote narxi noto'g'ri")
             context.user_data["ps_quantity"] = quantity
-            context.user_data["ps_product_code"] = product["product_code"]
-            context.user_data["ps_price"] = float(price)
+            context.user_data["ps_quote_usd"] = str(quote_usd)
+            context.user_data["ps_idempotency_key"] = "stars_" + str(uuid.uuid4())
+            context.user_data["ps_price"] = price
             context.user_data["state"] = None
             await update.message.reply_text(
-                f"⭐ Telegram Stars\n\n👤 @{context.user_data['ps_username']}\n"
-                f"📦 {product['name']}\n💰 {price:,.0f} so'm\n"
-                f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\nTasdiqlaysizmi?",
+                f"⭐ Stars\n\n"
+                f"👤 @{context.user_data['ps_username']}\n"
+                f"⭐ {quantity}\n"
+                f"💰 {price:,.0f} so'm\n"
+                f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\n"
+                "Tasdiqlaysizmi?",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ Tasdiqlash", callback_data="ps_confirm_stars"),
                     InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel"),
                 ]])
             )
         except Exception:
-            log.exception("Bay2Game Stars catalog lookup failed")
-            await update.message.reply_text("❌ Bay2Game katalogidan Stars narxini olishda xatolik.")
+            await update.message.reply_text("❌ Stars narxini olishda xatolik.")
         return
 
+    # ========================================================
+    # PAYSTARS: PREMIUM USERNAME
+    # ========================================================
     if state == "ps_premium_username":
-        name = text.strip().lstrip("@")
-        months = int(context.user_data.get("ps_months", 0) or 0)
-        if not name or " " in name or len(name) > 64 or months not in (3, 6, 12):
-            await update.message.reply_text("❌ Username yoki Premium muddati noto'g'ri.")
+        name = text.lstrip("@")
+        months = int(context.user_data.get("ps_months", 0))
+        if not name or " " in name or months not in (3, 6, 12):
+            await update.message.reply_text("❌ Username noto'g'ri.")
             return
         try:
-            product = await asyncio.to_thread(find_bay2game_telegram_product, "premium", months)
-            if not product:
-                await update.message.reply_text(
-                    f"❌ Telegram Premium {months} oy Bay2Game katalogida topilmadi.\n"
-                    "Admin 🔄 Katalog tugmasini yangilasin yoki Bay2Game katalogini tekshirsin."
-                )
-                return
-            context.user_data["ps_username"] = name
-            context.user_data["ps_product_code"] = product["product_code"]
-            context.user_data["ps_price"] = float(product["price"])
+            if not PAYSTARS_API_KEY:
+                raise RuntimeError("PAYSTARS_API_KEY sozlanmagan")
+            r = await asyncio.to_thread(ps_check_user, name, "premium")
+            if not r.get("valid"):
+                reason = r.get("detail") or r.get("message") or "Bu username Premium uchun yaroqsiz."
+                raise RuntimeError(str(reason)[:250])
+            token = r.get("verification_token")
+            if not token:
+                raise RuntimeError("Verification token qaytmadi")
+            quote_usd = await asyncio.to_thread(ps_quote, r.get("username") or name, "premium", months)
+            price = ps_sell(quote_usd, "premium")
+            if price <= 0:
+                raise RuntimeError("PayStars quote narxi noto'g'ri")
+            context.user_data["ps_username"] = r.get("username") or name
+            context.user_data["ps_token"] = r.get("verification_token")
+            context.user_data["ps_quote_usd"] = str(quote_usd)
+            context.user_data["ps_idempotency_key"] = "premium_" + str(uuid.uuid4())
+            context.user_data["ps_price"] = price
             context.user_data["state"] = None
             await update.message.reply_text(
-                f"💎 Telegram Premium\n\n👤 @{name}\n📦 {product['name']}\n"
-                f"💰 {product['price']:,.0f} so'm\n"
-                f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\nTasdiqlaysizmi?",
+                f"💎 Premium\n\n"
+                f"👤 @{name}\n"
+                f"💎 {months} oy\n"
+                f"💰 {price:,.0f} so'm\n"
+                f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\n"
+                "Tasdiqlaysizmi?",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ Tasdiqlash", callback_data="ps_confirm_premium"),
                     InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel"),
                 ]])
             )
-        except Exception:
-            log.exception("Bay2Game Premium catalog lookup failed")
-            await update.message.reply_text("❌ Bay2Game katalogidan Premium narxini olishda xatolik.")
+        except Exception as e:
+            log.warning("PayStars Premium username check failed: %s", e)
+            msg = str(e)
+            if "401" in msg or "403" in msg or "API_KEY" in msg:
+                user_msg = "❌ Xizmat hozircha ishlamayapti.\n\n🛠 Texnik nosozlik."
+            elif "422" in msg:
+                user_msg = "❌ Username topilmadi yoki Premium uchun mavjud emas."
+            elif "429" in msg:
+                user_msg = "❌ Juda ko'p tekshiruv. Birozdan keyin qayta urinib ko'ring."
+            else:
+                user_msg = "❌ Username tekshirishda texnik nosozlik yuz berdi.\n\n🛠 Keyinroq qayta urinib ko'ring."
+            await update.message.reply_text(user_msg)
         return
 
     # ========================================================
