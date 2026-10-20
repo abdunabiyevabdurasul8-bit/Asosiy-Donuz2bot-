@@ -1579,14 +1579,21 @@ async def admin_bot_detail(update, context, bot_id):
 
 
 # ============================================================
-# TELEGRAM STARS / PREMIUM — BAY2GAME ONLY
+# TELEGRAM STARS TG / PREMIUM TG
 # ============================================================
 def bay2game_telegram_games():
     c = conn()
     try:
         rows = c.execute("SELECT game_id,name FROM games WHERE active=1 ORDER BY name").fetchall()
-        return [(int(row["game_id"]), str(row["name"] or "")) for row in rows
-                if any(term in str(row["name"] or "").lower() for term in ("star", "premium"))]
+        result = []
+        for row in rows:
+            name = str(row["name"] or "")
+            low = name.lower()
+            if "star" in low:
+                result.append((int(row["game_id"]), "⭐ Stars TG"))
+            elif "premium" in low:
+                result.append((int(row["game_id"]), "💎 Premium TG"))
+        return result
     finally:
         c.close()
 
@@ -1604,13 +1611,12 @@ async def bay2game_telegram_menu(update, context):
     kb, games = bay2game_telegram_keyboard()
     if not games:
         await q.message.reply_text(
-            "⭐ Stars / 💎 Premium paketlari Bay2Game katalogida topilmadi.\n\n"
-            "Admin katalogni yangilab, Bay2Game API ushbu xizmatlarni taqdim etishini tekshirishi kerak.",
+            "⭐ Stars TG / 💎 Premium TG xizmatlari hozircha topilmadi. Keyinroq qayta urinib ko'ring.",
             reply_markup=kb,
         )
         return
     await q.message.reply_text(
-        "⭐ <b>Stars / 💎 Premium</b>\n\nBay2Game katalogidan xizmatni tanlang:",
+        "⭐ <b>Stars TG / 💎 Premium TG</b>\n\nKerakli xizmatni tanlang:",
         parse_mode="HTML", reply_markup=kb
     )
 
@@ -1627,26 +1633,38 @@ async def bay2game_telegram_game(update, context, game_id):
     finally:
         c.close()
     if not game or not products:
-        await q.message.reply_text("❌ Bay2Game katalogida paket topilmadi. Admin katalogni yangilasin.")
+        await q.message.reply_text("❌ Paketlar topilmadi. Katalogni yangilab, keyinroq qayta urinib ko'ring.")
         return
     context.user_data.clear()
     rows = []
+    priced_count = 0
     for item in products:
         try:
             price = float(item["sale_price"] or 0)
         except Exception:
             price = 0
         if price <= 0:
+            rows.append([InlineKeyboardButton(
+                f"{item['package_name']} — Narx yuklanmagan",
+                callback_data="b2tg_unpriced"
+            )])
             continue
+        priced_count += 1
         rows.append([InlineKeyboardButton(
             f"{item['package_name']} — {price:,.0f} so'm",
             callback_data=f"b2tg_pkg_{game_id}_{int(item['paket_id'])}"
         )])
     rows.append([InlineKeyboardButton("🔙 Orqaga", callback_data="telegram_services")])
-    if len(rows) == 1:
-        await q.message.reply_text("❌ Ushbu xizmat uchun narxli paket topilmadi.")
+    if priced_count == 0:
+        await q.message.reply_text(
+            "⚠️ Bu xizmat uchun narx yuklanmagan. Iltimos, keyinroq qayta tekshiring.",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
         return
-    await q.message.reply_text(f"📦 {game['name']} — paketni tanlang:", reply_markup=InlineKeyboardMarkup(rows))
+    await q.message.reply_text(
+        f"📦 {'⭐ Stars TG' if 'star' in str(game['name']).lower() else '💎 Premium TG'} — paketni tanlang:",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 
 async def bay2game_telegram_package(update, context, game_id, paket_id):
@@ -1660,16 +1678,17 @@ async def bay2game_telegram_package(update, context, game_id, paket_id):
     finally:
         c.close()
     if not row or float(row["sale_price"] or 0) <= 0:
-        await q.message.reply_text("❌ Paket yoki narx topilmadi. Katalogni yangilang.")
+        await q.message.reply_text("⚠️ Narx yuklanmagan. Iltimos, keyinroq qayta tekshiring.")
         return
+    display_name = "⭐ Stars TG" if "star" in str(row["game_name"]).lower() else "💎 Premium TG"
     context.user_data["b2tg_game_id"] = game_id
     context.user_data["b2tg_paket_id"] = paket_id
-    context.user_data["b2tg_game_name"] = row["game_name"]
+    context.user_data["b2tg_game_name"] = display_name
     context.user_data["b2tg_product_name"] = row["package_name"]
     context.user_data["b2tg_price"] = float(row["sale_price"])
     context.user_data["state"] = "b2tg_username"
     await q.message.reply_text(
-        f"📦 {row['game_name']}\n🎁 {row['package_name']}\n💰 {float(row['sale_price']):,.0f} so'm\n\n"
+        f"📦 {display_name}\n🎁 {row['package_name']}\n💰 {float(row['sale_price']):,.0f} so'm\n\n"
         "👤 Qabul qiluvchining Telegram username'ini yuboring (@username)."
     )
 
@@ -1690,7 +1709,7 @@ async def bay2game_telegram_confirm(update, context):
     if get_balance(uid) < Decimal(str(price)):
         await q.message.reply_text(f"❌ Balans yetarli emas.\nKerak: {price:,.0f} so'm\nBalans: {get_balance(uid):,.0f} so'm")
         return
-    add_balance(uid, -price, "purchase", f"Bay2Game {game_name} {product_name}")
+    add_balance(uid, -price, "purchase", f"Telegram service {game_name} {product_name}")
     try:
         status, data = await asyncio.to_thread(api_post, "/order", {
             "game_id": game_id, "paket_id": paket_id, "player_id": username
@@ -1699,11 +1718,11 @@ async def bay2game_telegram_confirm(update, context):
             raise RuntimeError(str((data or {}).get("error") or data or f"HTTP {status}")[:300])
         oid = str(data.get("order_id") or data.get("reference") or "")
         if not oid:
-            raise RuntimeError("Bay2Game buyurtma ID qaytarmadi")
+            raise RuntimeError("Buyurtma raqami qaytmadi")
         service_type = "stars" if "star" in (game_name + " " + product_name).lower() else "premium"
         save_external_order(uid, "bay2game", service_type, oid, "@" + username, price=price, status=str(data.get("status", "processing")))
         await q.message.reply_text(
-            f"✅ Buyurtma Bay2Game'ga yuborildi!\n\n🆔 Buyurtma: {oid}\n👤 @{username}\n📦 {game_name} — {product_name}\n💰 {price:,.0f} so'm\n📊 Holat: {data.get('status', 'processing')}"
+            f"✅ Buyurtmangiz qabul qilindi!\n\n🆔 Buyurtma: {oid}\n👤 @{username}\n📦 {game_name} — {product_name}\n💰 {price:,.0f} so'm\n📊 Holat: {data.get('status', 'processing')}"
         )
         try:
             await context.bot.send_message(
@@ -1711,11 +1730,11 @@ async def bay2game_telegram_confirm(update, context):
                 text=f"🆕 TELEGRAM XIZMATI BUYURTMASI\n\n📦 {game_name} — {product_name}\n👤 @{username}\n🆔 User ID: {uid}\n💰 {price:,.0f} so'm\n📋 Buyurtma: {oid}\n📊 {data.get('status', 'processing')}"
             )
         except Exception:
-            log.exception("Bay2Game Telegram xizmat buyurtmasi haqida adminga xabar yuborilmadi")
+            log.exception("Telegram xizmat buyurtmasi haqida adminga xabar yuborilmadi")
         context.user_data.clear()
     except Exception as exc:
-        log.exception("Bay2Game Telegram service order failed")
-        add_balance(uid, price, "refund", f"Bay2Game Telegram xizmat refund: {product_name}")
+        log.exception("Telegram service order failed")
+        add_balance(uid, price, "refund", f"Telegram service refund: {product_name}")
         await notify_bot_owner_technical(context, uid, str(exc))
         await q.message.reply_text("❌ Buyurtma bajarilmadi. Pul balansingizga qaytarildi. Texnik xato adminga yuborildi.")
         context.user_data.clear()
@@ -7154,6 +7173,8 @@ async def callback_router(update, context):
         return await bay2game_telegram_menu(update, context)
     if d.startswith("b2tg_game_"):
         return await bay2game_telegram_game(update, context, int(d.rsplit("_", 1)[1]))
+    if d == "b2tg_unpriced":
+        return await q.answer("Narx yuklanmagan. Keyinroq qayta urinib ko'ring.", show_alert=True)
     if d.startswith("b2tg_pkg_"):
         parts = d.split("_")
         return await bay2game_telegram_package(update, context, int(parts[2]), int(parts[3]))
