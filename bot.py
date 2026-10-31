@@ -1149,6 +1149,11 @@ def ensure_external_schema():
             if name not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {typ}")
 
+        # Eski bazalarda payments.requested_amount ustuni bo'lmasligi mumkin.
+        payment_columns = {r["name"] for r in c.execute("PRAGMA table_info(payments)").fetchall()}
+        if "requested_amount" not in payment_columns:
+            c.execute("ALTER TABLE payments ADD COLUMN requested_amount DOUBLE PRECISION DEFAULT 0")
+
         # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
         for table, cols in {
             "games": {"provider_game_code": "TEXT DEFAULT ''", "game_fields_json": "TEXT DEFAULT '[]'"},
@@ -2469,13 +2474,23 @@ def bay2game_create_order(product_code, player_id, server_id=""):
         error_text = str(
             raw.get("error") or raw.get("message") or
             nested.get("error") or nested.get("message") or
-            f"Buyurtma rad etildi (HTTP {status}, status={order_status})."
+            f"Buyurtma javobi noaniq (HTTP {status}, status={order_status})."
         )
+        # Tarmoq uzilishi/timeout yoki server xatosi buyurtma qabul qilinmaganini
+        # isbotlamaydi. Shu reference bilan tekshirish uchun processing holatida saqlaymiz.
+        uncertain = (status == 0 or status in (408, 425, 429) or status >= 500)
+        if uncertain:
+            log.warning("Bay2Game javobi noaniq; refund qilinmaydi: HTTP=%s ref=%s", status, reference)
+            return status, {
+                "ok": True, "uncertain": True, "order_id": reference,
+                "reference": reference, "status": "processing", "error": error_text,
+                "price": {"amount": 0}, "charged": {"amount": 0}, "raw": raw,
+            }
         log.error(
             "Avtomatik buyurtma API tomonidan rad etildi: HTTP=%s status=%s error=%s response_keys=%s",
             status, order_status, error_text[:500], list(raw.keys())
         )
-        return status, {"ok": False, "error": error_text, "raw": raw}
+        return status, {"ok": False, "error": error_text, "reference": reference, "raw": raw}
     provider_reference = str(payload.get("reference") or nested.get("reference") or raw.get("reference") or reference)
     normalized_status = "success" if order_status in ("success", "completed", "complete", "done") else "processing"
     return status, {
@@ -4405,6 +4420,27 @@ async def confirm(update, context):
             reply_markup=main_menu()
         )
 
+        try:
+            tg_user = q.from_user
+            uname = f"@{tg_user.username}" if getattr(tg_user, "username", None) else "username yo'q"
+            await context.bot.send_message(
+                chat_id=bot_admin_id(context),
+                text=(
+                    "⚠️ BUYURTMA XATOSI / PUL QAYTARILDI\n\n"
+                    f"👤 Foydalanuvchi: {tg_user.full_name} ({uname})\n"
+                    f"🆔 Telegram ID: {uid}\n"
+                    f"🎮 O'yin ID: {game_id} | Paket ID: {paket_id}\n"
+                    f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
+                    f"🆔 Player ID: {player_id}\n"
+                    f"🌐 Server ID: {server_id or '-'}\n"
+                    f"💰 Summa: {price:,.0f} so'm\n"
+                    f"📊 HTTP: {status}\n"
+                    f"🔎 Xato: {str(data.get('error') or data.get('message') or "Noma'lum")[:500]}\n"
+                    "💳 Holat: pul balansga qaytarildi"
+                )
+            )
+        except Exception:
+            log.exception("Admin buyurtma xabari yuborilmadi")
         await notify_bot_owner_technical(
             context,
             uid,
@@ -7156,6 +7192,22 @@ async def check_orders(context):
                 f"📦 Buyurtma #{r['id']}\n\n"
                 f"📊 Yangi status: {new_status}"
             )
+            try:
+                await context.bot.send_message(
+                    chat_id=bot_admin_id(context),
+                    text=(
+                        f"🔔 BUYURTMA HOLATI O'ZGARDI #{r['id']}\n\n"
+                        f"👤 Foydalanuvchi ID: {r['user_id']}\n"
+                        f"🎮 O'yin ID: {r['game_id']}\n"
+                        f"📦 Paket: {r['product_name']}\n"
+                        f"🆔 Player ID: {r['player_id']}\n"
+                        f"🔢 Provayder ID: {r['playpay_order_id']}\n"
+                        f"📊 Yangi holat: {new_status}\n"
+                        f"🕒 Vaqt: {datetime.now(ZoneInfo('Asia/Tashkent')).strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                )
+            except Exception:
+                log.exception("Admin status xabari yuborilmadi")
 
         except Exception as e:
 
