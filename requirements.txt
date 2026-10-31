@@ -1,6 +1,5 @@
-python-telegram-bot==22.5
+python-telegram-bot[job-queue]==22.8
 requests>=2.31.0
 cryptography>=42.0.0
 psycopg2-binary
 certifi>=2026.10.19
-python-telegram-bot[job-queue]==22.8
