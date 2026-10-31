@@ -1149,10 +1149,19 @@ def ensure_external_schema():
             if name not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {typ}")
 
-        # Eski bazalarda payments.requested_amount ustuni bo'lmasligi mumkin.
-        payment_columns = {r["name"] for r in c.execute("PRAGMA table_info(payments)").fetchall()}
+        # Eski bazalarda payments jadvalining yangi ustunlari bo'lmasligi mumkin.
+        # Chek qabul qilish uchun ikkala ustun ham zarur.
+        payment_columns = {
+            r["name"] for r in c.execute("PRAGMA table_info(payments)").fetchall()
+        }
         if "requested_amount" not in payment_columns:
-            c.execute("ALTER TABLE payments ADD COLUMN requested_amount DOUBLE PRECISION DEFAULT 0")
+            c.execute(
+                "ALTER TABLE payments ADD COLUMN requested_amount DOUBLE PRECISION DEFAULT 0"
+            )
+        if "photo_id" not in payment_columns:
+            c.execute(
+                "ALTER TABLE payments ADD COLUMN photo_id TEXT DEFAULT ''"
+            )
 
         # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
         for table, cols in {
