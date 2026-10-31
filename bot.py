@@ -1474,12 +1474,35 @@ async def start_child_bot(bot_id):
     row = child_bot_row(bot_id)
     if not row or not child_active(row):
         return
-    token = decrypt_token(row["token_enc"])
+
+    # Eski child SQLite bazalarida yangi jadvallar bo'lmasligi mumkin.
+    # Har bir child botni ishga tushirishdan oldin aynan uning bazasini migratsiya qilamiz.
+    child_db = row["db_path"]
+    previous_db = CURRENT_DB.get()
+    CURRENT_DB.set(child_db)
+    try:
+        init_db()
+        ensure_external_schema()
+    finally:
+        CURRENT_DB.set(previous_db)
+
+    try:
+        token = decrypt_token(row["token_enc"])
+    except InvalidToken:
+        log.error(
+            "Child bot %s tokeni ochilmadi: BOT_TOKEN_ENCRYPTION_KEY avvalgi shifrlash kalitiga mos emas. "
+            "Kalitni almashtirmang; kerak bo'lsa bot tokenini paneldan qayta ulang.",
+            bot_id,
+        )
+        return
+
     app = build_application(token, child=True)
     CHILD_APPS[bot_id] = app
     await app.initialize()
     await app.start()
     if app.updater:
+        # Polling ishlatishdan oldin shu botda qolgan webhookni olib tashlaymiz.
+        await app.bot.delete_webhook(drop_pending_updates=True)
         await app.updater.start_polling(drop_pending_updates=True)
     log.info("Child bot ishga tushdi: @%s (%s)", row["bot_username"], bot_id)
 
@@ -7135,19 +7158,27 @@ async def check_orders(context):
     set_request_db(context)
     c = conn()
 
-    rows = c.execute(
-        """
+    orders_sql = """
         SELECT *
         FROM orders
-        WHERE status IN
-        ('processing','pending')
+        WHERE status IN ('processing','pending')
           AND playpay_order_id IS NOT NULL
           AND playpay_order_id!=''
         ORDER BY id ASC
         LIMIT 30
-        """
-    ).fetchall()
-
+    """
+    try:
+        rows = c.execute(orders_sql).fetchall()
+    except Exception as exc:
+        c.close()
+        # Eski child SQLite bazasida orders jadvali yo'q bo'lsa, sxemani xavfsiz yaratib qayta urinib ko'ramiz.
+        if "no such table: orders" not in str(exc).lower():
+            raise
+        log.warning("Bot %s bazasida orders jadvali yo'q; DB sxemasi yangilanmoqda", context.bot.id)
+        init_db()
+        ensure_external_schema()
+        c = conn()
+        rows = c.execute(orders_sql).fetchall()
     c.close()
 
     for r in rows:
@@ -8120,9 +8151,21 @@ def main():
     # TELEGRAM POLLING
     # --------------------------------------------------------
 
-    app.run_polling(
-        drop_pending_updates=True
-    )
+    # Ushbu bot tokenida oldin webhook yoqilgan bo'lsa, getUpdates (polling)
+    # bilan to'qnashmasligi uchun webhookni pollingdan oldin o'chiramiz.
+    try:
+        wh = _requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+            json={"drop_pending_updates": True},
+            timeout=20,
+        )
+        wh_data = wh.json() if wh.ok else {}
+        if not wh.ok or not wh_data.get("ok"):
+            log.warning("Main bot webhookni o'chirish javobi muvaffaqiyatsiz (HTTP %s)", wh.status_code)
+    except Exception:
+        log.exception("Main bot webhookni o'chirishda xato")
+
+    app.run_polling(drop_pending_updates=True)
 
 
 # ============================================================
