@@ -1025,6 +1025,25 @@ def init_db():
     );
     """)
 
+    # Eski bazalarda payments jadvali turlicha bo'lishi mumkin.
+    # Kerakli ustunlarni qo'shamiz; eski majburiy amount ustunini saqlab qolamiz.
+    payment_columns = {
+        r["name"]
+        for r in c.execute("PRAGMA table_info(payments)").fetchall()
+    }
+    payment_migrations = {
+        "requested_amount": "REAL DEFAULT 0",
+        "approved_amount": "REAL DEFAULT 0",
+        "photo_id": "TEXT DEFAULT ''",
+        "status": "TEXT DEFAULT 'pending'",
+        "created_at": "TEXT DEFAULT ''",
+        "approved_at": "TEXT DEFAULT ''",
+    }
+    for column, definition in payment_migrations.items():
+        if column not in payment_columns:
+            c.execute(
+                f"ALTER TABLE payments ADD COLUMN {column} {definition}"
+            )
     c.commit()
     c.close()
 
@@ -1148,20 +1167,6 @@ def ensure_external_schema():
         for name, typ in additions.items():
             if name not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {typ}")
-
-        # Eski bazalarda payments jadvalining yangi ustunlari bo'lmasligi mumkin.
-        # Chek qabul qilish uchun ikkala ustun ham zarur.
-        payment_columns = {
-            r["name"] for r in c.execute("PRAGMA table_info(payments)").fetchall()
-        }
-        if "requested_amount" not in payment_columns:
-            c.execute(
-                "ALTER TABLE payments ADD COLUMN requested_amount DOUBLE PRECISION DEFAULT 0"
-            )
-        if "photo_id" not in payment_columns:
-            c.execute(
-                "ALTER TABLE payments ADD COLUMN photo_id TEXT DEFAULT ''"
-            )
 
         # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
         for table, cols in {
@@ -1474,35 +1479,12 @@ async def start_child_bot(bot_id):
     row = child_bot_row(bot_id)
     if not row or not child_active(row):
         return
-
-    # Eski child SQLite bazalarida yangi jadvallar bo'lmasligi mumkin.
-    # Har bir child botni ishga tushirishdan oldin aynan uning bazasini migratsiya qilamiz.
-    child_db = row["db_path"]
-    previous_db = CURRENT_DB.get()
-    CURRENT_DB.set(child_db)
-    try:
-        init_db()
-        ensure_external_schema()
-    finally:
-        CURRENT_DB.set(previous_db)
-
-    try:
-        token = decrypt_token(row["token_enc"])
-    except InvalidToken:
-        log.error(
-            "Child bot %s tokeni ochilmadi: BOT_TOKEN_ENCRYPTION_KEY avvalgi shifrlash kalitiga mos emas. "
-            "Kalitni almashtirmang; kerak bo'lsa bot tokenini paneldan qayta ulang.",
-            bot_id,
-        )
-        return
-
+    token = decrypt_token(row["token_enc"])
     app = build_application(token, child=True)
     CHILD_APPS[bot_id] = app
     await app.initialize()
     await app.start()
     if app.updater:
-        # Polling ishlatishdan oldin shu botda qolgan webhookni olib tashlaymiz.
-        await app.bot.delete_webhook(drop_pending_updates=True)
         await app.updater.start_polling(drop_pending_updates=True)
     log.info("Child bot ishga tushdi: @%s (%s)", row["bot_username"], bot_id)
 
@@ -2506,23 +2488,13 @@ def bay2game_create_order(product_code, player_id, server_id=""):
         error_text = str(
             raw.get("error") or raw.get("message") or
             nested.get("error") or nested.get("message") or
-            f"Buyurtma javobi noaniq (HTTP {status}, status={order_status})."
+            f"Buyurtma rad etildi (HTTP {status}, status={order_status})."
         )
-        # Tarmoq uzilishi/timeout yoki server xatosi buyurtma qabul qilinmaganini
-        # isbotlamaydi. Shu reference bilan tekshirish uchun processing holatida saqlaymiz.
-        uncertain = (status == 0 or status in (408, 425, 429) or status >= 500)
-        if uncertain:
-            log.warning("Bay2Game javobi noaniq; refund qilinmaydi: HTTP=%s ref=%s", status, reference)
-            return status, {
-                "ok": True, "uncertain": True, "order_id": reference,
-                "reference": reference, "status": "processing", "error": error_text,
-                "price": {"amount": 0}, "charged": {"amount": 0}, "raw": raw,
-            }
         log.error(
             "Avtomatik buyurtma API tomonidan rad etildi: HTTP=%s status=%s error=%s response_keys=%s",
             status, order_status, error_text[:500], list(raw.keys())
         )
-        return status, {"ok": False, "error": error_text, "reference": reference, "raw": raw}
+        return status, {"ok": False, "error": error_text, "raw": raw}
     provider_reference = str(payload.get("reference") or nested.get("reference") or raw.get("reference") or reference)
     normalized_status = "success" if order_status in ("success", "completed", "complete", "done") else "processing"
     return status, {
@@ -4452,27 +4424,6 @@ async def confirm(update, context):
             reply_markup=main_menu()
         )
 
-        try:
-            tg_user = q.from_user
-            uname = f"@{tg_user.username}" if getattr(tg_user, "username", None) else "username yo'q"
-            await context.bot.send_message(
-                chat_id=bot_admin_id(context),
-                text=(
-                    "⚠️ BUYURTMA XATOSI / PUL QAYTARILDI\n\n"
-                    f"👤 Foydalanuvchi: {tg_user.full_name} ({uname})\n"
-                    f"🆔 Telegram ID: {uid}\n"
-                    f"🎮 O'yin ID: {game_id} | Paket ID: {paket_id}\n"
-                    f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
-                    f"🆔 Player ID: {player_id}\n"
-                    f"🌐 Server ID: {server_id or '-'}\n"
-                    f"💰 Summa: {price:,.0f} so'm\n"
-                    f"📊 HTTP: {status}\n"
-                    f"🔎 Xato: {str(data.get('error') or data.get('message') or "Noma'lum")[:500]}\n"
-                    "💳 Holat: pul balansga qaytarildi"
-                )
-            )
-        except Exception:
-            log.exception("Admin buyurtma xabari yuborilmadi")
         await notify_bot_owner_technical(
             context,
             uid,
@@ -5387,24 +5338,49 @@ async def photo_handler(update, context):
 
     c = conn()
 
+    # Bazada eski "amount" ustuni ham bo'lsa, uni ham to'ldiramiz.
+    # Ustunlar va parametrlar soni har doim bir-biriga mos bo'ladi.
+    payment_columns = {
+        r["name"]
+        for r in c.execute("PRAGMA table_info(payments)").fetchall()
+    }
+
+    payment_values = {
+        "user_id": u.id,
+        "amount": float(amount),
+        "requested_amount": float(amount),
+        "approved_amount": 0,
+        "photo_id": photo_id,
+        "status": "pending",
+        "created_at": datetime.now().isoformat(),
+        "approved_at": "",
+    }
+
+    insert_columns = [
+        name for name in payment_values
+        if name in payment_columns
+    ]
+
+    if "user_id" not in insert_columns or "photo_id" not in insert_columns:
+        c.close()
+        log.error(
+            "payments jadvalida kerakli ustun yo'q: %s",
+            sorted(payment_columns)
+        )
+        await update.message.reply_text(
+            "❌ To'lov bazasida kerakli ustun topilmadi. "
+            "Iltimos, adminga xabar bering."
+        )
+        return
+
+    placeholders = ",".join("?" for _ in insert_columns)
+    columns_sql = ",".join(insert_columns)
+    values = tuple(payment_values[name] for name in insert_columns)
+
     cur = c.execute(
-        """
-        INSERT INTO payments
-        (
-            user_id,
-            requested_amount,
-            photo_id,
-            status,
-            created_at
-        )
-        VALUES (?,?,?,'pending',?)
-        """,
-        (
-            u.id,
-            float(amount),
-            photo_id,
-            datetime.now().isoformat()
-        )
+        f"INSERT INTO payments ({columns_sql}) "
+        f"VALUES ({placeholders})",
+        values
     )
 
     pid = cur.lastrowid
@@ -7158,27 +7134,19 @@ async def check_orders(context):
     set_request_db(context)
     c = conn()
 
-    orders_sql = """
+    rows = c.execute(
+        """
         SELECT *
         FROM orders
-        WHERE status IN ('processing','pending')
+        WHERE status IN
+        ('processing','pending')
           AND playpay_order_id IS NOT NULL
           AND playpay_order_id!=''
         ORDER BY id ASC
         LIMIT 30
-    """
-    try:
-        rows = c.execute(orders_sql).fetchall()
-    except Exception as exc:
-        c.close()
-        # Eski child SQLite bazasida orders jadvali yo'q bo'lsa, sxemani xavfsiz yaratib qayta urinib ko'ramiz.
-        if "no such table: orders" not in str(exc).lower():
-            raise
-        log.warning("Bot %s bazasida orders jadvali yo'q; DB sxemasi yangilanmoqda", context.bot.id)
-        init_db()
-        ensure_external_schema()
-        c = conn()
-        rows = c.execute(orders_sql).fetchall()
+        """
+    ).fetchall()
+
     c.close()
 
     for r in rows:
@@ -7232,22 +7200,6 @@ async def check_orders(context):
                 f"📦 Buyurtma #{r['id']}\n\n"
                 f"📊 Yangi status: {new_status}"
             )
-            try:
-                await context.bot.send_message(
-                    chat_id=bot_admin_id(context),
-                    text=(
-                        f"🔔 BUYURTMA HOLATI O'ZGARDI #{r['id']}\n\n"
-                        f"👤 Foydalanuvchi ID: {r['user_id']}\n"
-                        f"🎮 O'yin ID: {r['game_id']}\n"
-                        f"📦 Paket: {r['product_name']}\n"
-                        f"🆔 Player ID: {r['player_id']}\n"
-                        f"🔢 Provayder ID: {r['playpay_order_id']}\n"
-                        f"📊 Yangi holat: {new_status}\n"
-                        f"🕒 Vaqt: {datetime.now(ZoneInfo('Asia/Tashkent')).strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
-                )
-            except Exception:
-                log.exception("Admin status xabari yuborilmadi")
 
         except Exception as e:
 
@@ -8151,21 +8103,9 @@ def main():
     # TELEGRAM POLLING
     # --------------------------------------------------------
 
-    # Ushbu bot tokenida oldin webhook yoqilgan bo'lsa, getUpdates (polling)
-    # bilan to'qnashmasligi uchun webhookni pollingdan oldin o'chiramiz.
-    try:
-        wh = _requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-            json={"drop_pending_updates": True},
-            timeout=20,
-        )
-        wh_data = wh.json() if wh.ok else {}
-        if not wh.ok or not wh_data.get("ok"):
-            log.warning("Main bot webhookni o'chirish javobi muvaffaqiyatsiz (HTTP %s)", wh.status_code)
-    except Exception:
-        log.exception("Main bot webhookni o'chirishda xato")
-
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True
+    )
 
 
 # ============================================================
