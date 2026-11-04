@@ -5374,7 +5374,7 @@ async def photo_handler(update, context):
             "photo_id": str(photo_id),
             "status": "pending",
             "created_at": datetime.now().isoformat(),
-            "approved_at": "",
+            "approved_at": None,
         }
 
         insert_columns = [
