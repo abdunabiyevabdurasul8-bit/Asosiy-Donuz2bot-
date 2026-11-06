@@ -1479,10 +1479,23 @@ def child_turnover(bot_id):
 
 
 def format_dt(value):
-    if not value:
+    """ISO sana yoki Unix timestampni Toshkent vaqtida o'qiladigan ko'rinishga keltiradi."""
+    if value is None or value == "":
         return "-"
     try:
-        return datetime.fromisoformat(value).strftime("%d.%m.%Y %H:%M")
+        # Ba'zi eski buyurtmalarda sana Unix timestamp (raqam) ko'rinishida saqlangan.
+        if isinstance(value, (int, float)) or str(value).strip().isdigit():
+            stamp = float(value)
+            # Millisekund timestamp bo'lsa sekundga o'tkazamiz.
+            if stamp > 100000000000:
+                stamp /= 1000.0
+            return datetime.fromtimestamp(stamp, ZoneInfo("Asia/Tashkent")).strftime("%d.%m.%Y %H:%M")
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Tashkent"))
+        else:
+            parsed = parsed.astimezone(ZoneInfo("Asia/Tashkent"))
+        return parsed.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return str(value)
 
@@ -5884,6 +5897,9 @@ async def orders_cb(update, context):
 
     q = update.callback_query
 
+    # Har bir ulangan botning buyurtmalarini aynan o'z bazasidan o'qiymiz.
+    set_request_db(context)
+
     c = conn()
 
     rows = c.execute(
@@ -5942,12 +5958,13 @@ async def orders_cb(update, context):
                 f"🌐 Server ID: {server}\n"
             )
 
+        order_date = format_dt(r["created_at"] if "created_at" in r.keys() else None)
+        provider_order_id = r["playpay_order_id"] if "playpay_order_id" in r.keys() else "-"
         text += (
-            f"💰 {r['sale_price']:,.0f} so'm\n"
-            f"📊 {r['status']}\n"
-            f"🔢 Bay2Game: "
-            f"{r['playpay_order_id']}\n"
-            f"🕐 {r['created_at']}\n\n"
+            f"💰 {float(r['sale_price'] or 0):,.0f} so'm\n"
+            f"📊 {r['status'] or 'Kutilmoqda'}\n"
+            f"🔢 Buyurtma ID: {provider_order_id or '-'}\n"
+            f"📅 Sana: {order_date}\n\n"
         )
 
     await q.message.reply_text(
