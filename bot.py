@@ -1236,6 +1236,26 @@ def ensure_external_schema():
                 updated_at TEXT NOT NULL
             )
         """)
+
+        # PostgreSQL: eski orders jadvalida id ustuni NOT NULL bo'lib,
+        # lekin DEFAULT nextval(...) bo'lmasligi mumkin. Mavjud yozuvlarni
+        # saqlagan holda avtomatik ID generatorini tiklaymiz.
+        if isinstance(c, PGConnection):
+            c.execute("CREATE SEQUENCE IF NOT EXISTS public.orders_id_seq")
+            c.execute(
+                "ALTER TABLE public.orders "
+                "ALTER COLUMN id SET DEFAULT nextval('public.orders_id_seq'::regclass)"
+            )
+            c.execute(
+                "ALTER SEQUENCE public.orders_id_seq OWNED BY public.orders.id"
+            )
+            c.execute(
+                "SELECT setval("
+                "'public.orders_id_seq', "
+                "GREATEST(COALESCE((SELECT MAX(id) FROM public.orders), 0) + 1, 1), "
+                "false)"
+            )
+
         c.commit()
     finally:
         c.close()
