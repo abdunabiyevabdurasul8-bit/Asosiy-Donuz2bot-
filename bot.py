@@ -207,6 +207,9 @@ except (ValueError, TypeError):
     ADMIN_ID = 0
 
 BAY2GAME_API_KEY = os.getenv("BAY2GAME_API_KEY", "").strip()
+PLAYPAY_API_KEY = os.getenv("PLAYPAY_API_KEY", "").strip()
+PLAYPAY_BASE = os.getenv("PLAYPAY_BASE", "https://playpay.uz/api/v1").rstrip("/")
+ORDER_CHANNEL_ID = os.getenv("ORDER_CHANNEL_ID", "@Donuz_Buyurtmlar").strip() or "@Donuz_Buyurtmlar"
 BAY2GAME_BASE = os.getenv("BAY2GAME_BASE", "https://api.bay2game.xyz/api").rstrip("/")
 # Bay2Game narxlari USD da. Kurs Render ENV orqali beriladi; admin ustamasi bot ichida boshqariladi.
 try:
@@ -300,6 +303,36 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(__name__)
+
+
+async def notify_order_channel(context, message):
+    """Har bir bot buyurtmasini asosiy bot orqali Donuz kanaliga yuboradi."""
+    try:
+        return await asyncio.to_thread(web_notify_order_channel, message)
+    except Exception as exc:
+        log.error("Buyurtma kanaliga xabar yuborilmadi (%s): %s", ORDER_CHANNEL_ID, type(exc).__name__)
+        return False
+
+
+def web_notify_order_channel(message):
+    """Sayt buyurtmalari uchun kanalga xabar yuborish."""
+    if not BOT_TOKEN:
+        log.error("Buyurtma kanaliga xabar yuborilmadi: BOT_TOKEN yo'q")
+        return False
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": ORDER_CHANNEL_ID, "text": message},
+            timeout=20,
+        )
+        data = response.json() if response.content else {}
+        if not response.ok or not data.get("ok"):
+            log.error("Kanal xabari Telegram tomonidan rad etildi: %s", data.get("description", response.status_code))
+            return False
+        return True
+    except Exception as exc:
+        log.exception("Sayt buyurtmasini kanalga yuborishda xato: %s", type(exc).__name__)
+        return False
 
 
 
@@ -587,13 +620,13 @@ def web_create_order(payload, user_id):
         cur = c.execute(
             """
             INSERT INTO orders(
-                user_id,playpay_order_id,game_id,paket_id,product_name,
+                bot_id,provider,user_id,playpay_order_id,game_id,paket_id,product_name,
                 player_id,fields_json,cost_usd,charged_usd,sale_price,
                 status,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                int(user_id), f"WEB-{web_order_id}", game_id, paket_id,
+                int(MAIN_BOT_ID or 0), "manual", int(user_id), f"WEB-{web_order_id}", game_id, paket_id,
                 product_name, player_id,
                 json.dumps({"player_id": player_id}, ensure_ascii=False),
                 0, 0, float(price), "manual_pending", now, now
@@ -607,16 +640,15 @@ def web_create_order(payload, user_id):
         c.commit()
         c.close()
 
+        manual_notice = (
+            f"🚗 YANGI GRAND MOBILE BUYURTMA #{local_id}\n\n"
+            f"📦 {product_name}\n🆔 ID: {player_id}\n"
+            f"💰 {price:,.0f} so'm\n👤 Telegram ID: {user_id}\n"
+            "📊 Holat: manual_pending"
+        )
         if ADMIN_ID:
-            _web_send_telegram_message(
-                ADMIN_ID,
-                "🆕 WEB GRAND MOBILE BUYURTMA\n\n"
-                f"📦 {product_name}\n"
-                f"🆔 ID: {player_id}\n"
-                f"💰 {price:,.0f} so'm\n"
-                f"👤 Telegram ID: {user_id}\n"
-                f"📋 Buyurtma: #{local_id}"
-            )
+            _web_send_telegram_message(ADMIN_ID, "🆕 WEB GRAND MOBILE BUYURTMA\n\n" + manual_notice)
+        web_notify_order_channel(manual_notice)
 
         return {
             "ok": True,
@@ -667,13 +699,13 @@ def web_create_order(payload, user_id):
     c.execute(
         """
         INSERT INTO orders(
-            user_id,playpay_order_id,game_id,paket_id,product_name,
+            bot_id,provider,user_id,playpay_order_id,game_id,paket_id,product_name,
             player_id,fields_json,cost_usd,charged_usd,sale_price,
             status,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
-            int(user_id), provider_order_id, game_id, paket_id,
+            int(MAIN_BOT_ID or 0), "bay2game", int(user_id), provider_order_id, game_id, paket_id,
             product_name, player_id,
             json.dumps({"player_id": player_id, "server_id": server_id}, ensure_ascii=False),
             float((data.get("price") or {}).get("amount", 0) or 0),
@@ -694,6 +726,7 @@ def web_create_order(payload, user_id):
     )
     if ADMIN_ID:
         _web_send_telegram_message(ADMIN_ID, order_notice)
+    web_notify_order_channel(order_notice)
     _web_send_telegram_message(
         user_id,
         f"✅ Buyurtmangiz qabul qilindi!\n\n📋 Buyurtma: #{local_id}\n"
@@ -929,6 +962,7 @@ def init_db():
 
     CREATE TABLE IF NOT EXISTS orders(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id INTEGER NOT NULL DEFAULT 0,
         user_id INTEGER,
         playpay_order_id TEXT,
         game_id INTEGER,
@@ -1147,6 +1181,7 @@ def ensure_external_schema():
         additions = {
             # Older PostgreSQL databases may have an orders table created by a previous version.
             # Add every column used by current order flows before handlers start.
+            "bot_id": "BIGINT NOT NULL DEFAULT 0",
             "user_id": "BIGINT",
             "playpay_order_id": "TEXT DEFAULT ''",
             "game_id": "BIGINT DEFAULT 0",
@@ -1161,7 +1196,7 @@ def ensure_external_schema():
             "created_at": "TEXT DEFAULT ''",
             "updated_at": "TEXT DEFAULT ''",
             "notified": "TEXT DEFAULT '0'",
-            "provider": "TEXT DEFAULT 'playpay'",
+            "provider": "TEXT DEFAULT 'bay2game'",
             "service_type": "TEXT DEFAULT ''",
             "target": "TEXT DEFAULT ''",
             "quantity": "DOUBLE PRECISION DEFAULT 0",
@@ -1236,39 +1271,6 @@ def ensure_external_schema():
                 updated_at TEXT NOT NULL
             )
         """)
-
-        # PostgreSQL: orders.id uchun mavjud DB turiga mos avtomatik ID generatori.
-        # Supabase'da id UUID bo'lishi mumkin; eski sxemalarda BIGINT ham uchraydi.
-        if isinstance(c, PGConnection):
-            id_info = c.execute(
-                "SELECT data_type, column_default "
-                "FROM information_schema.columns "
-                "WHERE table_schema='public' AND table_name='orders' AND column_name='id'"
-            ).fetchone()
-            if id_info:
-                id_type = str(id_info["data_type"]).lower()
-                id_default = id_info["column_default"]
-                if id_type == "uuid" and not id_default:
-                    c.execute(
-                        "ALTER TABLE public.orders "
-                        "ALTER COLUMN id SET DEFAULT gen_random_uuid()"
-                    )
-                elif id_type in ("bigint", "integer") and not id_default:
-                    c.execute("CREATE SEQUENCE IF NOT EXISTS public.orders_id_seq")
-                    c.execute(
-                        "ALTER TABLE public.orders "
-                        "ALTER COLUMN id SET DEFAULT nextval('public.orders_id_seq'::regclass)"
-                    )
-                    c.execute(
-                        "ALTER SEQUENCE public.orders_id_seq OWNED BY public.orders.id"
-                    )
-                    c.execute(
-                        "SELECT setval("
-                        "'public.orders_id_seq', "
-                        "GREATEST(COALESCE((SELECT MAX(id) FROM public.orders), 0) + 1, 1), "
-                        "false)"
-                    )
-
         c.commit()
     finally:
         c.close()
@@ -2023,6 +2025,13 @@ async def bay2game_telegram_confirm(update, context):
             started_at=started_at, order_id=order_id, http_status=api_status,
             api_data=api_data, balance_action=f"-{price:,.0f} so'm (xarid)",
         )
+        await notify_order_channel(
+            context,
+            f"⭐ TELEGRAM BUYURTMA #{order_id}\n\n"
+            f"👤 Telegram ID: {uid}\n📨 Qabul qiluvchi: @{username}\n"
+            f"📦 {game_name} — {product_name}\n💰 {price:,.0f} so'm\n"
+            f"📊 Holat: {final_status}\n🕒 {started_at}"
+        )
         context.user_data.clear()
     except Exception as exc:
         log.exception("Telegram Stars/Premium buyurtmasida xato")
@@ -2502,22 +2511,51 @@ def get_packages_api(game_id):
 
 
 def playpay_check_id(game_id, player_id, server_id=None, charname=None):
-    """Faqat kiritilgan ID mavjudligini tekshiradi; o'yinchi nickini tasdiqlamaydi.
-
-    Hozirgi buyurtma API adapterida ID->nickname tekshiruv endpointi yo'q.
-    Shuning uchun IDni nickname deb ko'rsatish yoki valid=True deb yolg'on
-    tasdiqlash mumkin emas.
-    """
+    """PlayPay'da faqat ID/nikni tekshiradi; buyurtmalar Bay2Game orqali ketadi."""
     player_id = str(player_id or "").strip()
     if not player_id:
         return 400, {"ok": False, "valid": False, "error": "Player ID kiritilmagan."}
-    return 200, {
-        "ok": True,
-        "valid": None,
-        "player_name": "",
-        "message": "Nickname tekshiruvi bu API orqali qo'llab-quvvatlanmaydi.",
-        "validation_supported": False,
-    }
+    if not PLAYPAY_API_KEY:
+        return 503, {"ok": False, "valid": False, "error": "PLAYPAY_API_KEY Render Environment'da sozlanmagan."}
+
+    payload = {"game_id": int(game_id), "player_id": player_id}
+    if server_id:
+        payload["server_id"] = str(server_id).strip()
+    if charname:
+        payload["charname"] = str(charname).strip()
+
+    try:
+        response = requests.post(
+            f"{PLAYPAY_BASE}/check_id",
+            headers={"X-API-Key": PLAYPAY_API_KEY, "Accept": "application/json", "Content-Type": "application/json"},
+            json=payload,
+            timeout=25,
+        )
+        try:
+            data = response.json()
+        except Exception:
+            data = {"message": response.text[:300]}
+        if not isinstance(data, dict):
+            data = {"message": str(data)}
+        if response.status_code >= 400 or data.get("ok") is False:
+            return response.status_code, {
+                "ok": False, "valid": False,
+                "error": str(data.get("error") or data.get("message") or f"PlayPay HTTP {response.status_code}"),
+            }
+        valid = data.get("valid")
+        if isinstance(valid, str):
+            valid = valid.strip().lower() in ("true", "valid", "1", "yes")
+        elif valid is not None:
+            valid = bool(valid)
+        return response.status_code, {
+            "ok": True, "valid": valid,
+            "player_name": str(data.get("player_name") or data.get("nickname") or data.get("name") or "").strip(),
+            "game_id": data.get("game_id", int(game_id)),
+            "player_id": data.get("player_id", player_id),
+        }
+    except requests.RequestException as exc:
+        log.warning("PlayPay ID tekshirish tarmoq xatosi: %s", type(exc).__name__)
+        return 0, {"ok": False, "valid": False, "error": "ID tekshirish xizmati bilan bog'lanib bo'lmadi."}
 
 
 def bay2game_create_order(product_code, player_id, server_id=""):
@@ -3794,10 +3832,10 @@ async def grand_confirm(update, context):
     c = conn()
     cur = c.execute(
         """INSERT INTO orders
-        (user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,
+        (bot_id,provider,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,
          cost_usd,charged_usd,sale_price,status,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (uid, "MANUAL", GRAND_MOBILE_GAME_ID, gc, f"Grand Mobile {gc} GC",
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (int(getattr(context.bot, "id", 0) or MAIN_BOT_ID or 0), "manual", uid, "MANUAL", GRAND_MOBILE_GAME_ID, gc, f"Grand Mobile {gc} GC",
          player_id, json.dumps({"grand_gc": gc, "manual": True}, ensure_ascii=False),
          0, 0, float(price), "manual_pending", datetime.now().isoformat(), datetime.now().isoformat())
     )
@@ -3829,6 +3867,14 @@ async def grand_confirm(update, context):
         )
     except Exception:
         log.exception("Grand Mobile admin xabari xatosi")
+
+    await notify_order_channel(
+        context,
+        f"🚗 YANGI GRAND MOBILE BUYURTMA #{order_id}\n\n"
+        f"👤 Telegram ID: {uid}\n📦 {gc} GC\n"
+        f"🆔 Grand Mobile ID: {player_id}\n💰 {price:,.0f} so'm\n"
+        "📊 Holat: manual_pending"
+    )
 
 
 # ============================================================
@@ -4537,6 +4583,8 @@ async def confirm(update, context):
         """
         INSERT INTO orders
         (
+            bot_id,
+            provider,
             user_id,
             playpay_order_id,
             game_id,
@@ -4551,9 +4599,11 @@ async def confirm(update, context):
             created_at,
             updated_at
         )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
+            int(getattr(context.bot, "id", 0) or MAIN_BOT_ID or 0),
+            "bay2game",
             uid,
             str(playpay_id),
             int(game_id),
@@ -4607,6 +4657,25 @@ async def confirm(update, context):
         f"📊 Status: {order_status}",
         reply_markup=main_menu()
     )
+
+    # Har bir o'yin buyurtmasi kanalga ham yuboriladi.
+    try:
+        _tg_user = q.from_user
+        _game_title = str(context.user_data.get("game_name") or context.user_data.get("offer_game_name") or context.user_data.get("selected_game_name") or f"O'yin {game_id}")
+        _channel_username = f"@{_tg_user.username}" if getattr(_tg_user, "username", None) else "username yo'q"
+        _channel_notice = (
+            f"🛒 YANGI BUYURTMA #{local_order_id}\n\n"
+            f"👤 Mijoz: {getattr(_tg_user, 'full_name', 'User')}\n"
+            f"🔗 Username: {_channel_username}\n🆔 Telegram ID: {uid}\n"
+            f"🎮 Xizmat: {_game_title}\n"
+            f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
+            f"🆔 O'yinchi ID: {player_id}\n"
+            + (f"🌐 Server ID: {server_id}\n" if requires_server else "")
+            + f"💰 Summa: {price:,.0f} so'm\n🔢 Bay2Game ID: {playpay_id or '-'}\n📊 Holat: {order_status}"
+        )
+        await notify_order_channel(context, _channel_notice)
+    except Exception:
+        log.exception("Buyurtmani kanalga tayyorlashda xato")
 
     # ========================================================
     # ADMIN: batafsil buyurtma hisoboti
@@ -5209,9 +5278,9 @@ async def text_handler(update, context):
             context.user_data.get("server_id", "")
         ).strip()
 
-        if not BAY2GAME_API_KEY:
+        if not PLAYPAY_API_KEY:
             await update.message.reply_text(
-                "❌ Xizmat vaqtincha sozlanmagan. Iltimos, keyinroq qayta urinib ko'ring."
+                "❌ ID tekshirish xizmati sozlanmagan. Administrator PLAYPAY_API_KEY ni Render Environment'ga qo'shishi kerak."
             )
             context.user_data["state"] = None
             return
@@ -5224,7 +5293,8 @@ async def text_handler(update, context):
             playpay_check_id,
             game_id,
             player_id,
-            server_id if server_id else None
+            server_id if server_id else None,
+            context.user_data.get("charname") or None
         )
 
         if not isinstance(data, dict):
