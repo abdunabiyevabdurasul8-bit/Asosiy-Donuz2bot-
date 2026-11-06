@@ -2511,23 +2511,68 @@ def get_packages_api(game_id):
 
 
 def playpay_check_id(game_id, player_id, server_id=None, charname=None):
-    """PlayPay'da faqat ID/nikni tekshiradi; buyurtmalar Bay2Game orqali ketadi."""
+    """PlayPay'da faqat ID/nikni tekshiradi; buyurtmalar Bay2Game orqali ketadi.
+
+    Muhim: botdagi game_id (masalan 141/54) PlayPay game_id bilan bir xil
+    bo'lishi shart emas. PlayPay hujjatiga ko'ra uning /games ro'yxatidagi
+    game_id yuborilishi kerak, shuning uchun nom bo'yicha moslashtiramiz.
+    """
     player_id = str(player_id or "").strip()
     if not player_id:
         return 400, {"ok": False, "valid": False, "error": "Player ID kiritilmagan."}
     if not PLAYPAY_API_KEY:
         return 503, {"ok": False, "valid": False, "error": "PLAYPAY_API_KEY Render Environment'da sozlanmagan."}
 
-    payload = {"game_id": int(game_id), "player_id": player_id}
-    if server_id:
-        payload["server_id"] = str(server_id).strip()
-    if charname:
-        payload["charname"] = str(charname).strip()
-
     try:
+        # Ichki katalogdagi o'yin nomini olamiz.
+        c = main_conn()
+        local_game = c.execute("SELECT name FROM games WHERE game_id=? LIMIT 1", (int(game_id),)).fetchone()
+        c.close()
+        local_name = str(local_game["name"] if local_game else "").strip()
+        if not local_name:
+            return 404, {"ok": False, "valid": False, "error": f"Bot katalogida game_id={game_id} topilmadi."}
+
+        headers = {"X-API-Key": PLAYPAY_API_KEY, "Accept": "application/json"}
+        games_response = requests.get(f"{PLAYPAY_BASE}/games", headers=headers, timeout=20)
+        try:
+            games_data = games_response.json()
+        except Exception:
+            games_data = {}
+        if games_response.status_code >= 400 or not isinstance(games_data, dict) or not games_data.get("ok"):
+            return games_response.status_code, {
+                "ok": False, "valid": False,
+                "error": str(games_data.get("error") or games_data.get("message") or f"PlayPay games HTTP {games_response.status_code}"),
+            }
+
+        def _game_key(value):
+            return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+        wanted = _game_key(local_name)
+        aliases = {
+            "pubgmobileglobal": {"pubgmobile", "pubgmobileglobal"},
+            "pubgmobile": {"pubgmobile", "pubgmobileglobal"},
+            "mobilelegends": {"mobilelegends", "mobilelegendbangbang", "mlbb"},
+            "mobilelegendbangbang": {"mobilelegends", "mobilelegendbangbang", "mlbb"},
+        }
+        accepted = aliases.get(wanted, {wanted})
+        matched = None
+        for item in games_data.get("games", []):
+            if _game_key(item.get("name")) in accepted:
+                matched = item
+                break
+        if not matched:
+            return 404, {"ok": False, "valid": False, "error": f"'{local_name}' PlayPay katalogida topilmadi. PlayPay /games ro'yxatidagi nom bilan moslashtirish kerak."}
+
+        playpay_game_id = int(matched.get("game_id"))
+        payload = {"game_id": playpay_game_id, "player_id": player_id}
+        if server_id:
+            payload["server_id"] = str(server_id).strip()
+        if charname:
+            payload["charname"] = str(charname).strip()
+
         response = requests.post(
             f"{PLAYPAY_BASE}/check_id",
-            headers={"X-API-Key": PLAYPAY_API_KEY, "Accept": "application/json", "Content-Type": "application/json"},
+            headers={**headers, "Content-Type": "application/json"},
             json=payload,
             timeout=25,
         )
