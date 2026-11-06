@@ -534,20 +534,21 @@ def web_check_id(payload):
 
 
 def web_create_order(payload, user_id):
-    game_id = int(payload.get("game_id", 0))
-    paket_id = int(payload.get("paket_id", 0))
+    """Sayt buyurtmasi: buyurtma tarixi DBga yozilmaydi, xabar mijoz va kanalga boradi."""
+    try:
+        game_id = int(payload.get("game_id", 0))
+        paket_id = int(payload.get("paket_id", 0))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "O'yin yoki paket noto'g'ri."}
+
     player_id = str(payload.get("player_id", "")).strip()
     server_id = str(payload.get("server_id", "")).strip()
-
     if not player_id:
         return {"ok": False, "error": "ID kiritilmagan."}
 
     c = main_conn()
     p = c.execute(
-        """
-        SELECT * FROM products
-        WHERE game_id=? AND paket_id=? AND active=1
-        """,
+        "SELECT * FROM products WHERE game_id=? AND paket_id=? AND active=1",
         (game_id, paket_id)
     ).fetchone()
     c.close()
@@ -566,181 +567,60 @@ def web_create_order(payload, user_id):
     if price <= 0:
         return {"ok": False, "error": "Narx noto'g'ri."}
 
-    balance = get_balance(user_id)
+    balance = Decimal(str(get_balance(user_id)))
     if balance < price:
-        return {
-            "ok": False,
-            "error": "Balans yetarli emas.",
-            "balance": float(balance),
-            "required": float(price),
-        }
+        return {"ok": False, "error": "Balans yetarli emas.", "balance": float(balance), "required": float(price)}
 
-    # ID qabul qilinadi; Bay2Game tekshiruvni buyurtma vaqtida bajaradi.
     if game_id != GRAND_MOBILE_GAME_ID:
-        check = web_check_id({
-            "game_id": game_id,
-            "player_id": player_id,
-            "server_id": server_id,
-        })
+        check = web_check_id({"game_id": game_id, "player_id": player_id, "server_id": server_id})
         if not check.get("ok"):
-            return {
-                "ok": False,
-                "error": "ID tekshirilmadi.",
-                "details": check,
-            }
+            return {"ok": False, "error": "ID tekshirilmadi.", "details": check}
 
-    web_token = uuid.uuid4().hex + uuid.uuid4().hex
-    now = datetime.now().isoformat()
-    c = main_conn()
-    c.execute(
-        """
-        INSERT INTO web_orders(
-            token,user_id,game_id,paket_id,product_name,player_id,
-            server_id,price,status,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            web_token, int(user_id), game_id, paket_id, product_name,
-            player_id, server_id, float(price), "processing", now, now
-        )
-    )
-    web_order_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-    c.commit()
-    c.close()
+    # Mablag'ni yechish; order ma'lumotlari alohida jadvalga yozilmaydi.
+    add_balance(user_id, -price, "order_hold", f"Sayt buyurtmasi: {product_name}")
+    now_text = datetime.now(ZoneInfo("Asia/Tashkent")).strftime("%d.%m.%Y %H:%M:%S")
 
-    # Balansni ushlab turamiz.
-    add_balance(
-        user_id, -price, "order_hold",
-        f"Web sayt buyurtma #{web_order_id}: {product_name}"
-    )
-
-    # Grand Mobile manual buyurtma
     if game_id == GRAND_MOBILE_GAME_ID:
-        c = main_conn()
-        cur = c.execute(
-            """
-            INSERT INTO orders(
-                bot_id,provider,user_id,playpay_order_id,game_id,paket_id,product_name,
-                player_id,fields_json,cost_usd,charged_usd,sale_price,
-                status,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                int(MAIN_BOT_ID or 0), "manual", int(user_id), f"WEB-{web_order_id}", game_id, paket_id,
-                product_name, player_id,
-                json.dumps({"player_id": player_id}, ensure_ascii=False),
-                0, 0, float(price), "manual_pending", now, now
-            )
-        )
-        local_id = cur.lastrowid
-        c.execute(
-            "UPDATE web_orders SET status='manual_pending',updated_at=? WHERE id=?",
-            (datetime.now().isoformat(), web_order_id)
-        )
-        c.commit()
-        c.close()
-
-        manual_notice = (
-            f"🚗 YANGI GRAND MOBILE BUYURTMA #{local_id}\n\n"
+        notice = (
+            f"🚗 YANGI GRAND MOBILE BUYURTMA\n\n"
             f"📦 {product_name}\n🆔 ID: {player_id}\n"
             f"💰 {price:,.0f} so'm\n👤 Telegram ID: {user_id}\n"
-            "📊 Holat: manual_pending"
+            f"🕒 {now_text}\n📊 Holat: Manual tekshiruvda"
         )
-        if ADMIN_ID:
-            _web_send_telegram_message(ADMIN_ID, "🆕 WEB GRAND MOBILE BUYURTMA\n\n" + manual_notice)
-        web_notify_order_channel(manual_notice)
+        sent_channel = web_notify_order_channel(notice)
+        sent_user = _web_send_telegram_message(
+            user_id,
+            "✅ Buyurtmangiz qabul qilindi!\n\n" + notice
+        )
+        if not sent_channel or not sent_user:
+            log.error("Grand Mobile web buyurtma xabari to'liq yuborilmadi: channel=%s user=%s", sent_channel, sent_user)
+        return {"ok": True, "status": "manual_pending", "message": "Buyurtma qabul qilindi. Telegram xabaringizni tekshiring."}
 
-        return {
-            "ok": True,
-            "status": "manual_pending",
-            "order_id": local_id,
-            "message": "Buyurtma qabul qilindi. Grand Mobile buyurtmasi manual bajariladi.",
-        }
-
-    # Bay2Game buyurtma
-    body = {
-        "game_id": game_id,
-        "paket_id": paket_id,
-        "player_id": player_id,
-    }
+    body = {"game_id": game_id, "paket_id": paket_id, "player_id": player_id}
     if server_id:
         body["server_id"] = server_id
-
     status, data = api_post("/order", body)
 
     if not isinstance(data, dict) or not data.get("ok"):
-        add_balance(
-            user_id, price, "order_refund",
-            f"Web sayt Bay2Game xatosi: {str(data)[:250]}"
-        )
-        c = main_conn()
-        c.execute(
-            "UPDATE web_orders SET status='failed',updated_at=? WHERE id=?",
-            (datetime.now().isoformat(), web_order_id)
-        )
-        c.commit()
-        c.close()
-        return {
-            "ok": False,
-            "error": "Buyurtmani bajarib bo'lmadi. Pul balansingizga qaytarildi.",
-        }
+        add_balance(user_id, price, "order_refund", f"Sayt buyurtmasi bekor qilindi: {str(data)[:200]}")
+        return {"ok": False, "error": "Buyurtmani bajarib bo'lmadi. Pul balansingizga qaytarildi."}
 
     provider_order_id = str(data.get("order_id", ""))
-    c = main_conn()
-    c.execute(
-        "UPDATE web_orders SET status=?,playpay_order_id=?,updated_at=? WHERE id=?",
-        (
-            str(data.get("status", "processing")),
-            provider_order_id,
-            datetime.now().isoformat(),
-            web_order_id,
-        )
+    order_status = str(data.get("status", "processing"))
+    notice = (
+        f"🛒 YANGI BUYURTMA\n\n📦 {product_name}\n"
+        f"🆔 O'yinchi ID: {player_id}\n"
+        + (f"🌐 Server ID: {server_id}\n" if server_id else "")
+        + f"💰 Summa: {price:,.0f} so'm\n👤 Telegram ID: {user_id}\n"
+        f"🕒 {now_text}\n🔢 Provayder ID: {provider_order_id or '-'}\n📊 Holat: {order_status}"
     )
-    c.execute(
-        """
-        INSERT INTO orders(
-            bot_id,provider,user_id,playpay_order_id,game_id,paket_id,product_name,
-            player_id,fields_json,cost_usd,charged_usd,sale_price,
-            status,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            int(MAIN_BOT_ID or 0), "bay2game", int(user_id), provider_order_id, game_id, paket_id,
-            product_name, player_id,
-            json.dumps({"player_id": player_id, "server_id": server_id}, ensure_ascii=False),
-            float((data.get("price") or {}).get("amount", 0) or 0),
-            float((data.get("charged") or {}).get("amount", 0) or 0),
-            float(price), str(data.get("status", "processing")),
-            now, now,
-        )
-    )
-    local_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-    c.commit()
-    c.close()
+    sent_channel = web_notify_order_channel(notice)
+    sent_user = _web_send_telegram_message(user_id, "✅ Buyurtmangiz qabul qilindi!\n\n" + notice)
+    if not sent_channel or not sent_user:
+        log.error("Web buyurtma xabari to'liq yuborilmadi: channel=%s user=%s", sent_channel, sent_user)
 
-    order_notice = (
-        f"🆕 WEB BUYURTMA #{local_id}\n\n"
-        f"📦 {product_name}\n🆔 ID: {player_id}\n"
-        f"💰 {price:,.0f} so'm\n👤 Telegram ID: {user_id}\n"
-        f"📊 {data.get('status', 'processing')}"
-    )
-    if ADMIN_ID:
-        _web_send_telegram_message(ADMIN_ID, order_notice)
-    web_notify_order_channel(order_notice)
-    _web_send_telegram_message(
-        user_id,
-        f"✅ Buyurtmangiz qabul qilindi!\n\n📋 Buyurtma: #{local_id}\n"
-        f"📦 {product_name}\n🆔 ID: {player_id}\n💰 {price:,.0f} so'm\n"
-        f"📊 Holat: {data.get('status', 'processing')}"
-    )
-
-    return {
-        "ok": True,
-        "status": str(data.get("status", "processing")),
-        "order_id": local_id,
-        "provider_order_id": provider_order_id,
-        "message": "Buyurtma qabul qilindi.",
-    }
+    return {"ok": True, "status": order_status, "provider_order_id": provider_order_id,
+            "message": "Buyurtma qabul qilindi. Telegram xabaringizni tekshiring."}
 
 
 class WebAPIHandler(BaseHTTPRequestHandler):
@@ -3849,19 +3729,8 @@ async def grand_confirm(update, context):
 
     add_balance(uid, -price, "order_hold", f"Grand Mobile manual: {gc} GC")
 
-    c = conn()
-    cur = c.execute(
-        """INSERT INTO orders
-        (bot_id,provider,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,
-         cost_usd,charged_usd,sale_price,status,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (int(getattr(context.bot, "id", 0) or MAIN_BOT_ID or 0), "manual", uid, "MANUAL", GRAND_MOBILE_GAME_ID, gc, f"Grand Mobile {gc} GC",
-         player_id, json.dumps({"grand_gc": gc, "manual": True}, ensure_ascii=False),
-         0, 0, float(price), "manual_pending", datetime.now().isoformat(), datetime.now().isoformat())
-    )
-    order_id = cur.lastrowid
-    c.commit()
-    c.close()
+    # Buyurtma bazaga yozilmaydi: faqat mijoz va buyurtmalar kanaliga yuboriladi.
+    order_id = "MANUAL"
 
     context.user_data.clear()
 
@@ -4597,62 +4466,8 @@ async def confirm(update, context):
         )
     )
 
-    c = conn()
-
-    cur = c.execute(
-        """
-        INSERT INTO orders
-        (
-            bot_id,
-            provider,
-            user_id,
-            playpay_order_id,
-            game_id,
-            paket_id,
-            product_name,
-            player_id,
-            fields_json,
-            cost_usd,
-            charged_usd,
-            sale_price,
-            status,
-            created_at,
-            updated_at
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            int(getattr(context.bot, "id", 0) or MAIN_BOT_ID or 0),
-            "bay2game",
-            uid,
-            str(playpay_id),
-            int(game_id),
-            int(paket_id),
-            context.user_data.get(
-                "offer_name",
-                "Paket"
-            ),
-            player_id,
-            json.dumps(
-                {
-                    "player_id": player_id,
-                    "server_id": server_id
-                },
-                ensure_ascii=False
-            ),
-            float(cost_usd),
-            float(charged_usd),
-            float(price),
-            order_status,
-            datetime.now().isoformat(),
-            datetime.now().isoformat()
-        )
-    )
-
-    local_order_id = cur.lastrowid
-
-    c.commit()
-    c.close()
+    # Buyurtma bazaga yozilmaydi. Provayder IDsi xabar uchun ishlatiladi.
+    local_order_id = str(playpay_id or "QABUL QILINDI")
 
     id_label = context.user_data.get(
         "id_label",
