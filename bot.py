@@ -181,6 +181,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
 )
 
 from telegram.ext import (
@@ -241,7 +242,7 @@ GRAND_MOBILE_PRICES = {
 }
 
 # 0 = Bay2Game API narxiga ustama qo'shilmaydi
-DEFAULT_MARKUP = Decimal("14")
+DEFAULT_MARKUP = Decimal("10")
 
 # Balans to'ldirish kartasi
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "").strip()
@@ -1602,6 +1603,15 @@ async def start_child_bot(bot_id):
     app = build_application(token, child=True)
     CHILD_APPS[bot_id] = app
     await app.initialize()
+    # Telegram chatdagi pastki chap menyuda barcha foydalanuvchilarga
+    # /start va /admin buyruqlarini ko'rsatish.
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "Botni ishga tushirish"),
+            BotCommand("admin", "Botni sozlash"),
+        ])
+    except Exception:
+        log.exception("Child bot %s buyruqlar menyusini sozlashda xato", bot_id)
     await app.start()
     if app.updater:
         await app.updater.start_polling(drop_pending_updates=True)
@@ -5169,20 +5179,17 @@ async def text_handler(update, context):
     if state == "add_bot_token":
         try:
             me, created = await create_child_bot(u.id, u.username or "", text)
-context.user_data.clear()
-status = child_bot_row(me["id"])
-bot_action = "✅ Bot qo'shildi!" if created else "✅ Bot yangilandi!"
-
-await update.message.reply_text(
-    f"{bot_action}\n\n"
-    f"🤖 @{me.get('username','')}\n"
-    f"🆔 Bot ID: {me['id']}\n"
-    "♾️ Obunasiz — doimiy ishlaydi.\n\n"
-    "⚙️ Sozlash uchun o‘z botingizga /admin yozing.",
-    reply_markup=main_menu()
-)
-
-except Exception as e:
+            context.user_data.clear()
+            status = child_bot_row(me["id"])
+            bot_action = "✅ Bot qo'shildi!" if created else "✅ Bot yangilandi!"
+            await update.message.reply_text(
+                f"{bot_action}\n\n"
+                f"🤖 @{me.get('username','')}\n"
+                f"🆔 Bot ID: {me['id']}\n"
+                "♾️ Obunasiz — doimiy ishlaydi.",
+                reply_markup=main_menu()
+            )
+        except Exception as e:
             await update.message.reply_text(f"❌ Bot qo'shib bo'lmadi:\n{e}")
         return
 
