@@ -5169,17 +5169,20 @@ async def text_handler(update, context):
     if state == "add_bot_token":
         try:
             me, created = await create_child_bot(u.id, u.username or "", text)
-            context.user_data.clear()
-            status = child_bot_row(me["id"])
-            bot_action = "✅ Bot qo'shildi!" if created else "✅ Bot yangilandi!"
-            await update.message.reply_text(
-                f"{bot_action}\n\n"
-                f"🤖 @{me.get('username','')}\n"
-                f"🆔 Bot ID: {me['id']}\n"
-                "♾️ Obunasiz — doimiy ishlaydi.",
-                reply_markup=main_menu()
-            )
-        except Exception as e:
+context.user_data.clear()
+status = child_bot_row(me["id"])
+bot_action = "✅ Bot qo'shildi!" if created else "✅ Bot yangilandi!"
+
+await update.message.reply_text(
+    f"{bot_action}\n\n"
+    f"🤖 @{me.get('username','')}\n"
+    f"🆔 Bot ID: {me['id']}\n"
+    "♾️ Obunasiz — doimiy ishlaydi.\n\n"
+    "⚙️ Sozlash uchun o‘z botingizga /admin yozing.",
+    reply_markup=main_menu()
+)
+
+except Exception as e:
             await update.message.reply_text(f"❌ Bot qo'shib bo'lmadi:\n{e}")
         return
 
