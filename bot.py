@@ -1447,14 +1447,32 @@ def get_child_markup(context):
 
 
 def child_turnover(bot_id):
+    """Child bot aylanmasi. Hali orders jadvali yaratilmagan bo'lsa 0 qaytaradi."""
     r = child_bot_row(bot_id)
     if not r:
         return 0, 0
     db = r["db_path"]
-    c = sqlite3.connect(db, timeout=30)
-    row = c.execute("SELECT COUNT(*), COALESCE(SUM(sale_price),0) FROM orders WHERE status NOT IN ('failed','cancelled','rejected')").fetchone()
-    c.close()
-    return int(row[0] or 0), float(row[1] or 0)
+    c = None
+    try:
+        c = sqlite3.connect(db, timeout=30)
+        row = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(sale_price),0) "
+            "FROM orders WHERE status NOT IN ('failed','cancelled','rejected')"
+        ).fetchone()
+        return int(row[0] or 0), float(row[1] or 0)
+    except sqlite3.OperationalError as e:
+        # Yangi child bot bazasida orders jadvali hali bo'lmasligi mumkin.
+        if "no such table: orders" in str(e).lower():
+            log.info("Child bot %s bazasida orders jadvali hali yo'q; aylanma 0", bot_id)
+            return 0, 0
+        log.exception("Child bot %s aylanmasini o'qishda SQLite xatosi", bot_id)
+        return 0, 0
+    except Exception:
+        log.exception("Child bot %s aylanmasini hisoblashda xato", bot_id)
+        return 0, 0
+    finally:
+        if c is not None:
+            c.close()
 
 
 
