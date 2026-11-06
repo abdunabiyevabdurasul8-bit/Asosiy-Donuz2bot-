@@ -1624,8 +1624,22 @@ async def bot_manage(update, context, bot_id):
     if not r or int(r["owner_user_id"])!=q.from_user.id: return await q.message.reply_text("❌ Bu bot sizniki emas.")
     orders,turn=child_turnover(bot_id); st=child_status(r)
     text=(f"🤖 <b>@{r['bot_username'] or bot_id}</b>\n\n🆔 Bot ID: <code>{bot_id}</code>\n👤 Egasi ID: <code>{r['owner_user_id']}</code>\n📅 Qo'shilgan: {format_dt(r['created_at'])}\n💰 Aylanma: {turn:,.0f} so'm\n📦 Buyurtmalar: {orders}\n🟢 Holati: ♾️ Doimiy faol\n💵 Ustama: {r['markup_uzs']:,.0f} so'm")
-    kb=[[InlineKeyboardButton("⚙️ Botlar sozlamalari",callback_data=f"bot_settings_{bot_id}")],[InlineKeyboardButton("▶️ Ishga tushirish",callback_data=f"bot_start_{bot_id}"),InlineKeyboardButton("⛔ To'xtatish",callback_data=f"bot_stop_{bot_id}")],[InlineKeyboardButton("🔙 Orqaga",callback_data="bot_list")]]
+    kb=[[InlineKeyboardButton("⚙️ Botlar sozlamalari",callback_data=f"bot_settings_{bot_id}")],[InlineKeyboardButton("🔐 Tokenni qayta ulash",callback_data=f"bot_relink_{bot_id}")],[InlineKeyboardButton("▶️ Ishga tushirish",callback_data=f"bot_start_{bot_id}"),InlineKeyboardButton("⛔ To'xtatish",callback_data=f"bot_stop_{bot_id}")],[InlineKeyboardButton("🔙 Orqaga",callback_data="bot_list")]]
     await q.message.reply_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def bot_relink_start(update, context, bot_id):
+    q = update.callback_query
+    row = child_bot_row(bot_id)
+    if not row or int(row["owner_user_id"]) != q.from_user.id:
+        return await q.message.reply_text("❌ Bu bot sizniki emas.")
+    context.user_data["state"] = "relink_child_bot_token"
+    context.user_data["relink_child_bot_id"] = int(bot_id)
+    await q.message.reply_text(
+        f"🔐 @{row['bot_username'] or bot_id} bot tokenini qayta ulang.\n\n"
+        "BotFather bergan yangi tokenni yuboring. Token yangi Fernet kaliti bilan shifrlanib saqlanadi.\n"
+        "⚠️ Tokenni bu chatdan boshqa joyga yubormang."
+    )
 
 
 async def bot_settings(update, context, bot_id):
@@ -2039,7 +2053,7 @@ async def bay2game_telegram_confirm(update, context):
                 f"💰 {price:,.0f} so'm\n🕒 {started_at}"
             )
             final_channel_text = pending_channel_text.replace(
-                "📊 Holat: ⏳ KUTILMOQDA", "📊 Holat: ✅ muvaffaqiyatli"
+                "📊 Holat: ⏳ KUTILMOQDA", "📊 Holat: ✅ TUSHIB BERILDI"
             )
             await context.bot.edit_message_text(
                 chat_id=uid, message_id=user_notice.message_id, text=final_user_text
@@ -2047,7 +2061,7 @@ async def bay2game_telegram_confirm(update, context):
             await context.bot.edit_message_text(
                 chat_id=ORDER_CHANNEL_ID, message_id=channel_notice.message_id, text=final_channel_text
             )
-            report_result = "MUVAFFAQIYATLI — MAHSULOT muvaffaqiyatli"
+            report_result = "MUVAFFAQIYATLI — MAHSULOT TUSHIB BERILDI"
             user_result_text = final_user_text
         else:
             report_result = "KUTILMOQDA — PROVAYDER TASDIQLASHI KERAK"
@@ -5051,6 +5065,34 @@ async def text_handler(update, context):
         return
 
     # ========================================================
+    # CHILD BOT TOKENINI QAYTA ULASH (ESKI SHIFRLASH KALITI YO'QOLGANDA)
+    # ========================================================
+    if state == "relink_child_bot_token":
+        bot_id = int(context.user_data.get("relink_child_bot_id") or 0)
+        row = child_bot_row(bot_id)
+        if not row or int(row["owner_user_id"]) != u.id:
+            context.user_data.pop("state", None)
+            context.user_data.pop("relink_child_bot_id", None)
+            await update.message.reply_text("❌ Bot yozuvi topilmadi yoki sizga tegishli emas.")
+            return
+        try:
+            # Eski polling nusxasi bo'lsa to'xtatamiz; token bazada yangilanadi.
+            await stop_child_bot(bot_id)
+            me, created = await create_child_bot(u.id, u.username or "", text.strip())
+            context.user_data.pop("state", None)
+            context.user_data.pop("relink_child_bot_id", None)
+            await update.message.reply_text(
+                f"✅ Bot tokeni yangilandi va qayta ulandi!\n\n"
+                f"🤖 @{me.get('username', '')}\n🆔 Bot ID: {me['id']}\n"
+                "🔐 Token yangi kalit bilan shifrlanib saqlandi.\n"
+                "🟢 Bot ishga tushdi.",
+                reply_markup=main_menu()
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Qayta ulash amalga oshmadi:\n{e}\n\nTokenni tekshirib qayta yuboring.")
+        return
+
+    # ========================================================
     # BOT TOKEN QO'SHISH
     # ========================================================
     if state == "add_bot_token":
@@ -7879,6 +7921,8 @@ async def callback_router(update, context):
         return await bot_list(update, context)
     if d.startswith("bot_manage_"):
         return await bot_manage(update, context, int(d.split("_")[-1]))
+    if d.startswith("bot_relink_"):
+        return await bot_relink_start(update, context, int(d.split("_")[-1]))
     if d.startswith("bot_settings_"):
         return await bot_settings(update, context, int(d.split("_")[-1]))
     if d.startswith("bot_markup_"):
