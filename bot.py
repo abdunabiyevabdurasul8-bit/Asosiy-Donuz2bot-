@@ -1237,24 +1237,37 @@ def ensure_external_schema():
             )
         """)
 
-        # PostgreSQL: eski orders jadvalida id ustuni NOT NULL bo'lib,
-        # lekin DEFAULT nextval(...) bo'lmasligi mumkin. Mavjud yozuvlarni
-        # saqlagan holda avtomatik ID generatorini tiklaymiz.
+        # PostgreSQL: orders.id uchun mavjud DB turiga mos avtomatik ID generatori.
+        # Supabase'da id UUID bo'lishi mumkin; eski sxemalarda BIGINT ham uchraydi.
         if isinstance(c, PGConnection):
-            c.execute("CREATE SEQUENCE IF NOT EXISTS public.orders_id_seq")
-            c.execute(
-                "ALTER TABLE public.orders "
-                "ALTER COLUMN id SET DEFAULT nextval('public.orders_id_seq'::regclass)"
-            )
-            c.execute(
-                "ALTER SEQUENCE public.orders_id_seq OWNED BY public.orders.id"
-            )
-            c.execute(
-                "SELECT setval("
-                "'public.orders_id_seq', "
-                "GREATEST(COALESCE((SELECT MAX(id) FROM public.orders), 0) + 1, 1), "
-                "false)"
-            )
+            id_info = c.execute(
+                "SELECT data_type, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='orders' AND column_name='id'"
+            ).fetchone()
+            if id_info:
+                id_type = str(id_info["data_type"]).lower()
+                id_default = id_info["column_default"]
+                if id_type == "uuid" and not id_default:
+                    c.execute(
+                        "ALTER TABLE public.orders "
+                        "ALTER COLUMN id SET DEFAULT gen_random_uuid()"
+                    )
+                elif id_type in ("bigint", "integer") and not id_default:
+                    c.execute("CREATE SEQUENCE IF NOT EXISTS public.orders_id_seq")
+                    c.execute(
+                        "ALTER TABLE public.orders "
+                        "ALTER COLUMN id SET DEFAULT nextval('public.orders_id_seq'::regclass)"
+                    )
+                    c.execute(
+                        "ALTER SEQUENCE public.orders_id_seq OWNED BY public.orders.id"
+                    )
+                    c.execute(
+                        "SELECT setval("
+                        "'public.orders_id_seq', "
+                        "GREATEST(COALESCE((SELECT MAX(id) FROM public.orders), 0) + 1, 1), "
+                        "false)"
+                    )
 
         c.commit()
     finally:
