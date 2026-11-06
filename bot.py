@@ -2039,7 +2039,7 @@ async def bay2game_telegram_confirm(update, context):
                 f"💰 {price:,.0f} so'm\n🕒 {started_at}"
             )
             final_channel_text = pending_channel_text.replace(
-                "📊 Holat: ⏳ KUTILMOQDA", "📊 Holat: ✅ TUSHIB BERILDI"
+                "📊 Holat: ⏳ KUTILMOQDA", "📊 Holat: ✅ muvaffaqiyatli"
             )
             await context.bot.edit_message_text(
                 chat_id=uid, message_id=user_notice.message_id, text=final_user_text
@@ -2047,7 +2047,7 @@ async def bay2game_telegram_confirm(update, context):
             await context.bot.edit_message_text(
                 chat_id=ORDER_CHANNEL_ID, message_id=channel_notice.message_id, text=final_channel_text
             )
-            report_result = "MUVAFFAQIYATLI — MAHSULOT TUSHIB BERILDI"
+            report_result = "MUVAFFAQIYATLI — MAHSULOT muvaffaqiyatli"
             user_result_text = final_user_text
         else:
             report_result = "KUTILMOQDA — PROVAYDER TASDIQLASHI KERAK"
