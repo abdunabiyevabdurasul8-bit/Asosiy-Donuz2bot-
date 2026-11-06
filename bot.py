@@ -2511,96 +2511,71 @@ def get_packages_api(game_id):
 
 
 def playpay_check_id(game_id, player_id, server_id=None, charname=None):
-    """PlayPay'da faqat ID/nikni tekshiradi; buyurtmalar Bay2Game orqali ketadi.
-
-    Muhim: botdagi game_id (masalan 141/54) PlayPay game_id bilan bir xil
-    bo'lishi shart emas. PlayPay hujjatiga ko'ra uning /games ro'yxatidagi
-    game_id yuborilishi kerak, shuning uchun nom bo'yicha moslashtiramiz.
-    """
+    """Faqat o'yinchi ID/nikini tekshiradi. PlayPay katalogi yoki buyurtma API ishlatilmaydi."""
     player_id = str(player_id or "").strip()
     if not player_id:
         return 400, {"ok": False, "valid": False, "error": "Player ID kiritilmagan."}
     if not PLAYPAY_API_KEY:
-        return 503, {"ok": False, "valid": False, "error": "PLAYPAY_API_KEY Render Environment'da sozlanmagan."}
+        return 503, {"ok": False, "valid": False, "error": "ID tekshirish sozlanmagan."}
 
     try:
-        # Ichki katalogdagi o'yin nomini olamiz.
         c = main_conn()
-        local_game = c.execute("SELECT name FROM games WHERE game_id=? LIMIT 1", (int(game_id),)).fetchone()
+        local_game = c.execute(
+            "SELECT name, provider_game_code FROM games WHERE game_id=? LIMIT 1",
+            (int(game_id),)
+        ).fetchone()
         c.close()
-        local_name = str(local_game["name"] if local_game else "").strip()
-        if not local_name:
-            return 404, {"ok": False, "valid": False, "error": f"Bot katalogida game_id={game_id} topilmadi."}
+        if not local_game:
+            return 404, {"ok": False, "valid": False, "error": "O'yin katalogda topilmadi."}
 
-        headers = {"X-API-Key": PLAYPAY_API_KEY, "Accept": "application/json"}
-        games_response = requests.get(f"{PLAYPAY_BASE}/games", headers=headers, timeout=20)
-        try:
-            games_data = games_response.json()
-        except Exception:
-            games_data = {}
-        if games_response.status_code >= 400 or not isinstance(games_data, dict) or not games_data.get("ok"):
-            return games_response.status_code, {
-                "ok": False, "valid": False,
-                "error": str(games_data.get("error") or games_data.get("message") or f"PlayPay games HTTP {games_response.status_code}"),
-            }
+        game_name = str(local_game["name"] or "").strip().lower()
+        game_code = str(local_game["provider_game_code"] or "").strip().lower()
+        if not game_code:
+            if "pubg" in game_name:
+                game_code = "pubgm"
+            elif "mobile legends" in game_name or "mlbb" in game_name:
+                game_code = "mlbb"
+            elif "free fire" in game_name:
+                game_code = "freefire"
+            else:
+                return 400, {"ok": False, "valid": False, "error": "Bu o'yin uchun tekshiruv kodi sozlanmagan."}
 
-        def _game_key(value):
-            return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
-
-        wanted = _game_key(local_name)
-        aliases = {
-            "pubgmobileglobal": {"pubgmobile", "pubgmobileglobal"},
-            "pubgmobile": {"pubgmobile", "pubgmobileglobal"},
-            "mobilelegends": {"mobilelegends", "mobilelegendbangbang", "mlbb"},
-            "mobilelegendbangbang": {"mobilelegends", "mobilelegendbangbang", "mlbb"},
-        }
-        accepted = aliases.get(wanted, {wanted})
-        matched = None
-        for item in games_data.get("games", []):
-            if _game_key(item.get("name")) in accepted:
-                matched = item
-                break
-        if not matched:
-            return 404, {"ok": False, "valid": False, "error": f"'{local_name}' PlayPay katalogida topilmadi. PlayPay /games ro'yxatidagi nom bilan moslashtirish kerak."}
-
-        playpay_game_id = int(matched.get("game_id"))
-        payload = {"game_id": playpay_game_id, "player_id": player_id}
+        payload = {"game": game_code, "user_id": player_id}
         if server_id:
             payload["server_id"] = str(server_id).strip()
         if charname:
             payload["charname"] = str(charname).strip()
 
         response = requests.post(
-            f"{PLAYPAY_BASE}/check_id",
-            headers={**headers, "Content-Type": "application/json"},
+            f"{PLAYPAY_BASE}/games/checkPlayerId",
+            headers={"X-API-Key": PLAYPAY_API_KEY, "Accept": "application/json", "Content-Type": "application/json"},
             json=payload,
             timeout=25,
         )
         try:
             data = response.json()
         except Exception:
-            data = {"message": response.text[:300]}
+            data = {}
         if not isinstance(data, dict):
-            data = {"message": str(data)}
-        if response.status_code >= 400 or data.get("ok") is False:
-            return response.status_code, {
-                "ok": False, "valid": False,
-                "error": str(data.get("error") or data.get("message") or f"PlayPay HTTP {response.status_code}"),
-            }
-        valid = data.get("valid")
-        if isinstance(valid, str):
-            valid = valid.strip().lower() in ("true", "valid", "1", "yes")
-        elif valid is not None:
-            valid = bool(valid)
+            data = {}
+        if response.status_code >= 400:
+            return response.status_code, {"ok": False, "valid": False, "error": str(data.get("message") or data.get("error") or "ID tekshirilmadi.")}
+
+        valid_value = data.get("valid")
+        valid = (str(valid_value).strip().lower() == "valid") if isinstance(valid_value, str) else bool(valid_value)
         return response.status_code, {
-            "ok": True, "valid": valid,
-            "player_name": str(data.get("player_name") or data.get("nickname") or data.get("name") or "").strip(),
-            "game_id": data.get("game_id", int(game_id)),
-            "player_id": data.get("player_id", player_id),
+            "ok": True,
+            "valid": valid,
+            "player_name": str(data.get("name") or "").strip(),
+            "game_code": game_code,
+            "player_id": player_id,
         }
     except requests.RequestException as exc:
-        log.warning("PlayPay ID tekshirish tarmoq xatosi: %s", type(exc).__name__)
-        return 0, {"ok": False, "valid": False, "error": "ID tekshirish xizmati bilan bog'lanib bo'lmadi."}
+        log.warning("ID tekshirish tarmoq xatosi: %s", type(exc).__name__)
+        return 0, {"ok": False, "valid": False, "error": "ID tekshirish vaqtida aloqa xatosi."}
+    except Exception:
+        log.exception("ID tekshirish ichki xatosi")
+        return 0, {"ok": False, "valid": False, "error": "ID tekshirishda ichki xatolik."}
 
 
 def bay2game_create_order(product_code, player_id, server_id=""):
@@ -5352,7 +5327,7 @@ async def text_handler(update, context):
         if data.get("ok") is False:
             error = str(data.get("error") or data.get("message") or "Tekshiruv xatosi")
             await update.message.reply_text(
-                f"❌ ID tekshirilmadi.\n\n{error}"
+                "❌ ID tekshirilmadi.\n\nID yoki server ma'lumotlarini tekshirib, qayta urinib ko'ring."
             )
             context.user_data["state"] = None
             return
@@ -7322,10 +7297,10 @@ async def check_orders(context):
         """
         SELECT *
         FROM orders
-        WHERE status IN
-        ('processing','pending')
-          AND playpay_order_id IS NOT NULL
-          AND playpay_order_id!=''
+        WHERE LOWER(status) IN ('processing','pending','in_progress')
+          AND COALESCE(NULLIF(provider_order_id,''), NULLIF(playpay_order_id,'')) IS NOT NULL
+          AND COALESCE(NULLIF(provider_order_id,''), NULLIF(playpay_order_id,'')) != ''
+          AND COALESCE(provider,'bay2game') = 'bay2game'
         ORDER BY id ASC
         LIMIT 30
         """
@@ -7339,7 +7314,7 @@ async def check_orders(context):
 
             status, data = await asyncio.to_thread(
                 get_playpay_order,
-                r["playpay_order_id"]
+                (r["provider_order_id"] if r["provider_order_id"] else r["playpay_order_id"])
             )
 
             if not data.get("ok"):
@@ -7351,12 +7326,15 @@ async def check_orders(context):
                 data
             )
 
-            new_status = order.get(
-                "status",
-                r["status"]
-            )
+            new_status = str(order.get("status", r["status"]) or r["status"]).lower()
+            if new_status in ("completed", "complete", "done", "success"):
+                new_status = "success"
+            elif new_status in ("failed", "failure", "rejected", "cancelled", "canceled"):
+                new_status = "failed"
+            elif new_status in ("pending", "processing", "in_progress", "queued"):
+                new_status = "processing" if new_status != "pending" else "pending"
 
-            if new_status == r["status"]:
+            if new_status == str(r["status"]).lower():
 
                 continue
 
