@@ -4506,7 +4506,7 @@ async def confirm(update, context):
             f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
             f"🆔 O'yinchi ID: {player_id}\n"
             + (f"🌐 Server ID: {server_id}\n" if requires_server else "")
-            + f"💰 Summa: {price:,.0f} so'm\n🔢 Bay2Game ID: {playpay_id or '-'}\n📊 Holat: {order_status}"
+            + f"💰 Summa: {price:,.0f} so'm\n🔢 Donuz ID: {playpay_id or '-'}\n📊 Holat: {order_status}"
         )
         await notify_order_channel(context, _channel_notice)
     except Exception:
