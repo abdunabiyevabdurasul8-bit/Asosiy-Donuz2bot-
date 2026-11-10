@@ -221,7 +221,7 @@ except Exception:
 PUBG_GAME_ID = 141
 PUBG_GLOBAL_GAME_ID = 142  # PUBG Mobile Global, alohida API katalogi bo'lsa
 MOBILE_LEGENDS_GAME_ID = 54
-MOBILE_LEGENDS_GLOBAL_GAME_ID = 55
+MOBILE_LEGENDS_GLOBAL_GAME_ID = 143
 GRAND_MOBILE_GAME_ID = 999001
 
 # Grand Mobile — faqat manual buyurtma, narxlar o'zgartirilmaydi
@@ -2184,7 +2184,7 @@ def bay2game_internal_id(value):
     if raw.isdigit():
         number = int(raw)
         # Grand Mobile va eski maxsus IDlar bilan to'qnashmasin.
-        if number not in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID, GRAND_MOBILE_GAME_ID):
+        if number not in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, GRAND_MOBILE_GAME_ID):
             return number
     return 100000000 + (int(hashlib.sha256(raw.encode()).hexdigest()[:12], 16) % 800000000)
 
@@ -2273,9 +2273,11 @@ def bay2game_game_internal_id(game_code, name=""):
         if "global" in label:
             return PUBG_GLOBAL_GAME_ID
         return PUBG_GAME_ID
-    if ("mobilelegends" in label or "mobilelegend" in label or label in ("mlbb",)):
-        if "global" in label or "international" in label or "worldwide" in label:
-            return MOBILE_LEGENDS_GLOBAL_GAME_ID
+    if "mobilelegends" in label or "mobilelegend" in label or label in ("mlbb",):
+        # Russia (mavjud 54 ID) saqlanadi. Global esa API qaytargan
+        # haqiqiy game_code asosida alohida ID oladi; taxminiy ID ishlatilmaydi.
+        if "global" in label or "global" in code.lower():
+            return bay2game_internal_id("mobile_legends_global:" + code)
         return MOBILE_LEGENDS_GAME_ID
     if "grandmobile" in label:
         return GRAND_MOBILE_GAME_ID
@@ -2846,9 +2848,7 @@ def telegram_stars_amount(product_code="", package_name=""):
 
 def sync_catalog():
     """Bay2Game categories va products katalogini yangilaydi."""
-    categories = get_games_api()
-    if not categories:
-        return False, "Katalog olinmadi. API sozlamalari va xizmat holatini tekshiring."
+    categories = get_games_api() or []
 
     game_count = 0
     product_count = 0
@@ -2918,8 +2918,9 @@ def sync_catalog():
         # API qaytargan o'yinlarni to'liq ko'rsatamiz; nomi PUBG Delay bo'lsa ham yashirmaymiz.
         # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
         region = str(category.get("region") or category.get("server") or category.get("version") or "").strip()
-        if "pubg" in name.lower() and region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
-            name = f"{name} Global"
+        if region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
+            if any(term in name.lower() for term in ("pubg", "mobile legends", "mobilelegend", "mlbb")):
+                name = f"{name} Global"
         if not game_code:
             continue
         gid = bay2game_game_internal_id(game_code, name)
@@ -2988,6 +2989,63 @@ def sync_catalog():
                 log.exception("Bay2Game product saqlash xatosi game=%s", game_code)
                 try: c.close()
                 except Exception: pass
+
+    # Mobile Legends Global — foydalanuvchi taqdim etgan Bay2Game SKU ro'yxati.
+    # Buyurtma endpointi product_code bilan ishlaydi; game_code taxmin qilinmaydi.
+    global_products = [
+        ("MLBB_GLOBAL_5", "5", "0.09"),
+        ("MLBB_GLOBAL_12", "12", "0.21"),
+        ("MLBB_GLOBAL_19", "19", "0.33"),
+        ("MLBB_GLOBAL_28", "28", "0.50"),
+        ("MLBB_GLOBAL_44", "44", "0.74"),
+        ("MLBB_GLOBAL_Weekly_Elite_Pack", "Weekly Elite Pack", "0.92"),
+        ("MLBB_GLOBAL_55", "55", "0.92"),
+        ("MLBB_GLOBAL_Diamond_Pass", "Diamond Pass", "0.94"),
+        ("MLBB_GLOBAL_59", "59", "0.98"),
+        ("MLBB_GLOBAL_85", "85", "1.41"),
+        ("MLBB_GLOBAL_Weekly", "Weekly", "1.79"),
+        ("MLBB_GLOBAL_165", "165", "2.74"),
+        ("MLBB_GLOBAL_170", "170", "2.83"),
+        ("MLBB_GLOBAL_240", "240", "4.01"),
+        ("MLBB_GLOBAL_Monthly_Elite_Pack", "Monthly Elite Pack", "4.58"),
+        ("MLBB_GLOBAL_275", "275", "4.58"),
+        ("MLBB_GLOBAL_296", "296", "4.92"),
+        ("MLBB_GLOBAL_408", "408", "6.77"),
+        ("MLBB_GLOBAL_Twilight", "Twilight", "9.21"),
+        ("MLBB_GLOBAL_565", "565", "9.21"),
+        ("MLBB_GLOBAL_568", "568", "9.24"),
+        ("MLBB_GLOBAL_875", "875", "14.17"),
+        ("MLBB_GLOBAL_2010", "2010", "30.80"),
+        ("MLBB_GLOBAL_4830", "4830", "73.88"),
+    ]
+    try:
+        c = conn()
+        c.execute(
+            "INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            (MOBILE_LEGENDS_GLOBAL_GAME_ID, "Mobile Legends Global", "User ID", 1, 0, 1,
+             datetime.now().isoformat(), "mlbb_global", json.dumps(["user_id", "server_id"]))
+        )
+        game_count += 1
+        usd_rate = get_bay2game_usd_uzs()
+        for product_code, title, reseller_usd in global_products:
+            usd = Decimal(reseller_usd)
+            api_uzs = usd * usd_rate
+            sale_price = calc_sale_price(api_uzs)
+            c.execute(
+                "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (MOBILE_LEGENDS_GLOBAL_GAME_ID, bay2game_internal_id(product_code),
+                 "Mobile Legends Global", title, float(usd), float(api_uzs), float(sale_price),
+                 1, datetime.now().isoformat(), product_code)
+            )
+            product_count += 1
+        c.commit()
+        c.close()
+    except Exception:
+        log.exception("Mobile Legends Global katalogini saqlashda xatolik")
+        try:
+            c.close()
+        except Exception:
+            pass
 
     if game_count == 0:
         return False, "Katalogda saqlash mumkin bo'lgan o'yin topilmadi."
@@ -3674,16 +3732,14 @@ async def games(update, context):
                 WHEN game_id=? THEN 0
                 WHEN game_id=? THEN 1
                 WHEN game_id=? THEN 2
-                WHEN game_id=? THEN 3
-                ELSE 4
+                ELSE 3
             END,
             name
         """,
         (
             PUBG_GAME_ID,
             PUBG_GLOBAL_GAME_ID,
-            MOBILE_LEGENDS_GAME_ID,
-            MOBILE_LEGENDS_GLOBAL_GAME_ID
+            MOBILE_LEGENDS_GAME_ID
         )
     ).fetchall()
 
@@ -3709,12 +3765,11 @@ async def games(update, context):
                         WHEN game_id=? THEN 0
                         WHEN game_id=? THEN 1
                         WHEN game_id=? THEN 2
-                        WHEN game_id=? THEN 3
-                        ELSE 4
+                        ELSE 3
                     END,
                     name
                 """,
-                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID)
+                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID)
             ).fetchall()
             c.close()
 
@@ -3823,7 +3878,7 @@ async def game(update, context):
     if game_id in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID):
         id_label = "Player ID"
         requires_server = False
-    elif game_id in (MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID):
+    elif game_id == MOBILE_LEGENDS_GAME_ID:
         id_label = "User ID"
         requires_server = True
 
@@ -3928,7 +3983,7 @@ async def offer(update, context):
 
     c.close()
 
-    if game_id in (MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID):
+    if game_id == MOBILE_LEGENDS_GAME_ID:
 
         id_label = "User ID"
         requires_server = True
@@ -7762,7 +7817,7 @@ def main():
     )
 
     print(
-        "       MOBILE LEGENDS RUSSIA ID: 54 | GLOBAL ID: 55"
+        "       MOBILE LEGENDS ID: 54"
     )
 
     print(
