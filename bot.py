@@ -221,6 +221,7 @@ except Exception:
 PUBG_GAME_ID = 141
 PUBG_GLOBAL_GAME_ID = 142  # PUBG Mobile Global, alohida API katalogi bo'lsa
 MOBILE_LEGENDS_GAME_ID = 54
+MOBILE_LEGENDS_GLOBAL_GAME_ID = 55
 GRAND_MOBILE_GAME_ID = 999001
 
 # Grand Mobile — faqat manual buyurtma, narxlar o'zgartirilmaydi
@@ -2183,7 +2184,7 @@ def bay2game_internal_id(value):
     if raw.isdigit():
         number = int(raw)
         # Grand Mobile va eski maxsus IDlar bilan to'qnashmasin.
-        if number not in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, GRAND_MOBILE_GAME_ID):
+        if number not in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID, GRAND_MOBILE_GAME_ID):
             return number
     return 100000000 + (int(hashlib.sha256(raw.encode()).hexdigest()[:12], 16) % 800000000)
 
@@ -2272,7 +2273,9 @@ def bay2game_game_internal_id(game_code, name=""):
         if "global" in label:
             return PUBG_GLOBAL_GAME_ID
         return PUBG_GAME_ID
-    if "mobilelegends" in label or "mobilelegend" in label or label in ("mlbb",):
+    if ("mobilelegends" in label or "mobilelegend" in label or label in ("mlbb",)):
+        if "global" in label or "international" in label or "worldwide" in label:
+            return MOBILE_LEGENDS_GLOBAL_GAME_ID
         return MOBILE_LEGENDS_GAME_ID
     if "grandmobile" in label:
         return GRAND_MOBILE_GAME_ID
@@ -3671,14 +3674,16 @@ async def games(update, context):
                 WHEN game_id=? THEN 0
                 WHEN game_id=? THEN 1
                 WHEN game_id=? THEN 2
-                ELSE 3
+                WHEN game_id=? THEN 3
+                ELSE 4
             END,
             name
         """,
         (
             PUBG_GAME_ID,
             PUBG_GLOBAL_GAME_ID,
-            MOBILE_LEGENDS_GAME_ID
+            MOBILE_LEGENDS_GAME_ID,
+            MOBILE_LEGENDS_GLOBAL_GAME_ID
         )
     ).fetchall()
 
@@ -3704,11 +3709,12 @@ async def games(update, context):
                         WHEN game_id=? THEN 0
                         WHEN game_id=? THEN 1
                         WHEN game_id=? THEN 2
-                        ELSE 3
+                        WHEN game_id=? THEN 3
+                        ELSE 4
                     END,
                     name
                 """,
-                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID)
+                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID)
             ).fetchall()
             c.close()
 
@@ -3817,7 +3823,7 @@ async def game(update, context):
     if game_id in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID):
         id_label = "Player ID"
         requires_server = False
-    elif game_id == MOBILE_LEGENDS_GAME_ID:
+    elif game_id in (MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID):
         id_label = "User ID"
         requires_server = True
 
@@ -3922,7 +3928,7 @@ async def offer(update, context):
 
     c.close()
 
-    if game_id == MOBILE_LEGENDS_GAME_ID:
+    if game_id in (MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID):
 
         id_label = "User ID"
         requires_server = True
@@ -7756,7 +7762,7 @@ def main():
     )
 
     print(
-        "       MOBILE LEGENDS ID: 54"
+        "       MOBILE LEGENDS RUSSIA ID: 54 | GLOBAL ID: 55"
     )
 
     print(
