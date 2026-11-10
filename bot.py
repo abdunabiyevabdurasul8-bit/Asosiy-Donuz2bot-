@@ -976,7 +976,6 @@ def init_db():
     set_default("premium_markup_percent", TELEGRAM_MARKUP_PERCENT)
     set_default("sim_markup_percent", SIM_MARKUP_PERCENT)
     set_default("referral_bonus_uzs", "100")
-    set_default("omonat_profit_percent", "1")
 
     if active_db() == MAIN_DB:
         c = conn()
@@ -1285,8 +1284,20 @@ def child_turnover(bot_id):
         return 0, 0
     db = r["db_path"]
     c = sqlite3.connect(db, timeout=30)
-    row = c.execute("SELECT COUNT(*), COALESCE(SUM(sale_price),0) FROM orders WHERE status NOT IN ('failed','cancelled','rejected')").fetchone()
-    c.close()
+    try:
+        cols = {row[1] for row in c.execute("PRAGMA table_info(orders)").fetchall()}
+        if "sale_price" in cols:
+            row = c.execute(
+                "SELECT COUNT(*), COALESCE(SUM(sale_price),0) FROM orders "
+                "WHERE status NOT IN ('failed','cancelled','rejected')"
+            ).fetchone()
+        else:
+            row = c.execute(
+                "SELECT COUNT(*), 0 FROM orders "
+                "WHERE status NOT IN ('failed','cancelled','rejected')"
+            ).fetchone()
+    finally:
+        c.close()
     return int(row[0] or 0), float(row[1] or 0)
 
 
@@ -1459,19 +1470,6 @@ async def manage_child_bots(context):
         except Exception as e:
             # Bitta noto'g'ri shifrlangan token scheduler'ni to'xtatmasin.
             log.error("Child bot %s start bo'lmadi: %s", bot_id, e)
-
-
-async def admin_command(update, context):
-    """Admin panelni /admin buyrug'i orqali ochish."""
-    set_request_db(context)
-    if not update.effective_user or update.effective_user.id != bot_admin_id(context):
-        if update.effective_message:
-            await update.effective_message.reply_text("❌ Siz admin emassiz.")
-        return
-    await update.effective_message.reply_text(
-        "👑 ADMIN PANEL",
-        reply_markup=admin_kb(context)
-    )
 
 
 def build_application(token, child=False):
@@ -1810,7 +1808,7 @@ async def bay2game_telegram_game(update, context, game_id):
     finally:
         c.close()
     if not game or not products:
-        await q.message.reply_text("❌ Paketlar topilmadi. Admin katalogni yangilasin.")
+        await q.message.reply_text("❌ Paket topilmadi. Admin katalogni yangilasin.")
         return
     context.user_data.clear()
     rows = []
@@ -2275,9 +2273,6 @@ def bay2game_game_internal_id(game_code, name=""):
             return PUBG_GLOBAL_GAME_ID
         return PUBG_GAME_ID
     if "mobilelegends" in label or "mobilelegend" in label or label in ("mlbb",):
-        if "global" in label:
-            # Global uchun alohida, API game_code ga bog'langan barqaror ID.
-            return bay2game_internal_id("mobile_legends_global:" + code)
         return MOBILE_LEGENDS_GAME_ID
     if "grandmobile" in label:
         return GRAND_MOBILE_GAME_ID
@@ -2517,7 +2512,7 @@ def bay2game_create_order(product_code, player_id, server_id=""):
 def api_post_no_idempotency(path, body):
     if path == "/check_id":
         return playpay_check_id(body.get("game_id"), body.get("player_id"), body.get("server_id"), body.get("charname"))
-    return 400, {"ok": False, "error": "Bu xizmat hozircha mavjud emas."}
+    return 400, {"ok": False, "error": "Bu so'rov qo'llab-quvvatlanmaydi."}
 
 
 def api_post(path, body):
@@ -2850,7 +2845,7 @@ def sync_catalog():
     """Bay2Game categories va products katalogini yangilaydi."""
     categories = get_games_api()
     if not categories:
-        return False, "Katalogni yangilab bo‘lmadi. Texnik sozlamalarni tekshiring."
+        return False, "Katalog olinmadi. API sozlamalari va xizmat holatini tekshiring."
 
     game_count = 0
     product_count = 0
@@ -2920,9 +2915,8 @@ def sync_catalog():
         # API qaytargan o'yinlarni to'liq ko'rsatamiz; nomi PUBG Delay bo'lsa ham yashirmaymiz.
         # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
         region = str(category.get("region") or category.get("server") or category.get("version") or "").strip()
-        if region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
-            if "pubg" in name.lower() or "mobile legends" in name.lower() or "mlbb" in name.lower():
-                name = f"{name} Global"
+        if "pubg" in name.lower() and region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
+            name = f"{name} Global"
         if not game_code:
             continue
         gid = bay2game_game_internal_id(game_code, name)
@@ -2994,7 +2988,7 @@ def sync_catalog():
 
     if game_count == 0:
         return False, "Katalogda saqlash mumkin bo'lgan o'yin topilmadi."
-    return True, f"✅ {game_count} ta o'yin, {product_count} ta paket yangilandi."
+    return True, f"✅ Katalog yangilandi: {game_count} ta o'yin, {product_count} ta paket."
 
 
 def add_one_calendar_month(value):
@@ -3045,8 +3039,8 @@ def process_due_omonats(notify=True):
                         json={
                             "chat_id": int(row["user_id"]),
                             "text": (
-                                f"🏦 Omonat #{oid} muddati tugadi!\n\n"
-                                f"💰 Omonat: {float(row['principal']):,.0f} so'm\n"
+                                f"✅ Mablagʻingiz muddati tugadi va balansingizga qaytarildi! #{oid} muddati tugadi!\n\n"
+                                f"💰 Qaytarilgan summa: {float(row['principal']):,.0f} so'm\n"
                                 f"📈 Foyda: {float(row['profit']):,.0f} so'm\n"
                                 f"✅ Balansga qaytarildi: {total:,.0f} so'm"
                             )
@@ -3071,10 +3065,6 @@ def omonat_worker():
         import time
         time.sleep(30)
 
-
-# ============================================================
-# FOYDALANUVCHILAR O'RTASIDA PUL O'TKAZISH
-# ============================================================
 
 async def transfer_start(update, context):
     q = update.callback_query
@@ -4271,7 +4261,7 @@ async def confirm(update, context):
         uid,
         -price,
         "order_hold",
-        f"Buyurtma: {game_id}/{paket_id}"
+        f"Avtomatik buyurtma: {game_id}/{paket_id}"
     )
 
     # ========================================================
@@ -4290,7 +4280,8 @@ async def confirm(update, context):
             uid,
             price,
             "order_refund",
-            "Buyurtma bajarilmadi; summa mijoz balansiga qaytarildi."
+            "Avtomatik buyurtma xatosi: "
+            f"{data.get('error','unknown')}"
         )
 
         # Foydalanuvchiga provider/API yoki sayt nomi ko'rsatilmaydi.
@@ -4755,6 +4746,7 @@ async def text_handler(update, context):
         context.user_data.clear()
         await update.message.reply_text(f"✅ Ustama saqlandi: {amount:,.0f} so'm",reply_markup=main_menu())
         return
+
 
     # ========================================================
     # DEPOSIT
@@ -5501,6 +5493,23 @@ async def promo_cb(update, context):
 # ADMIN COMMAND
 # ============================================================
 
+async def admin_command(update, context):
+
+    set_request_db(context)
+    if update.effective_user.id != bot_admin_id(context):
+
+        await update.message.reply_text(
+            "❌ Siz admin emassiz."
+        )
+
+        return
+
+    await update.message.reply_text(
+        "👑 ADMIN PANEL",
+        reply_markup=admin_kb(context)
+    )
+
+
 # ============================================================
 # ADMIN STATS
 # ============================================================
@@ -6181,6 +6190,34 @@ async def admin_text_handler(update, context):
     if not state:
 
         return False
+
+    # ========================================================
+    # BAY2GAME USD KURSI
+    # ========================================================
+    if state == "bay2game_usd_uzs":
+        try:
+            rate = Decimal(text.replace(" ", "").replace(",", ".").replace("so'm", ""))
+        except Exception:
+            await update.message.reply_text("❌ Kursni raqamda yuboring. Masalan: 13000")
+            return True
+        if rate < 1 or rate > 100000000:
+            await update.message.reply_text("❌ Kurs 1 dan 100 000 000 so'mgacha bo'lishi kerak.")
+            return True
+        set_setting("bay2game_usd_uzs", str(rate))
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Valyuta kursi saqlandi: 1 USD = {rate:,.2f} so'm\n"
+            "🔄 Katalog va paket narxlari yangilanmoqda..."
+        )
+        ok, result = await asyncio.to_thread(sync_catalog)
+        if ok:
+            await asyncio.to_thread(sync_all_child_catalogs)
+        await update.message.reply_text(
+            f"{'✅' if ok else '⚠️'} {result}\n\n"
+            "Yangi kurs katalog paketlariga qo'llandi.",
+            reply_markup=admin_kb(context)
+        )
+        return True
 
     # ========================================================
     # REFERAL BONUSI
@@ -7048,7 +7085,7 @@ async def admin_callback(update, context):
 
     d = q.data
 
-    platform_only_callbacks = {"a_sync"}
+    platform_only_callbacks = {"adm_bay2game_rate", "adm_playpay_balance", "a_sync"}
     if d in platform_only_callbacks and (is_child_bot(context) or q.from_user.id != ADMIN_ID):
         await q.answer("Xatolik", show_alert=True)
         return
@@ -7237,6 +7274,7 @@ async def admin_callback(update, context):
             context
         )
 
+
     # ========================================================
     # FAQAT ADMIN KATALOG YANGILAYDI
     # ========================================================
@@ -7293,6 +7331,7 @@ async def callback_router(update, context):
         return await transfer_start(update, context)
     if d == "transfer_confirm":
         return await transfer_confirm(update, context)
+
 
     # Telegram Stars / Premium — faqat ikkita aniq xizmat tanlovi.
     if d == "telegram_services":
@@ -7661,13 +7700,13 @@ def main():
     if not BAY2GAME_API_KEY:
 
         raise SystemExit(
-            "❌ BAY2GAME_API_KEY Environment Variable yozilmagan."
+            "❌ API kaliti Environment Variable orqali kiritilmagan."
         )
 
     if Fernet is None:
         raise SystemExit("❌ cryptography o'rnatilmagan. requirements.txt ga cryptography qo'shing.")
 
-    # Eski faol omonatlar bo‘lsa, muddatida asosiy summani qaytarish uchun worker saqlanadi.
+    # Omonat muddatlarini fon rejimida tekshirish (har 30 soniyada).
     threading.Thread(target=omonat_worker, daemon=True, name="omonat-worker").start()
 
     # --------------------------------------------------------
