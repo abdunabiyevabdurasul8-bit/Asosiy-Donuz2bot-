@@ -1461,6 +1461,19 @@ async def manage_child_bots(context):
             log.error("Child bot %s start bo'lmadi: %s", bot_id, e)
 
 
+async def admin_command(update, context):
+    """Admin panelni /admin buyrug'i orqali ochish."""
+    set_request_db(context)
+    if not update.effective_user or update.effective_user.id != bot_admin_id(context):
+        if update.effective_message:
+            await update.effective_message.reply_text("❌ Siz admin emassiz.")
+        return
+    await update.effective_message.reply_text(
+        "👑 ADMIN PANEL",
+        reply_markup=admin_kb(context)
+    )
+
+
 def build_application(token, child=False):
     app = Application.builder().token(token).build()
     app.add_error_handler(error_handler)
