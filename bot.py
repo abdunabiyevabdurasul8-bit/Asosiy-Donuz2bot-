@@ -3052,6 +3052,57 @@ def sync_catalog():
     return True, f"✅ Katalog yangilandi: {game_count} ta o'yin, {product_count} ta paket."
 
 
+def ensure_mobile_legends_global_catalog():
+    """Global paketlarini startup paytida DB ga yozadi; katalog tugmasini kutmaydi."""
+    global_products = [
+        ("MLBB_GLOBAL_5", "5", "0.09"),
+        ("MLBB_GLOBAL_12", "12", "0.21"),
+        ("MLBB_GLOBAL_19", "19", "0.33"),
+        ("MLBB_GLOBAL_28", "28", "0.50"),
+        ("MLBB_GLOBAL_44", "44", "0.74"),
+        ("MLBB_GLOBAL_Weekly_Elite_Pack", "Weekly Elite Pack", "0.92"),
+        ("MLBB_GLOBAL_55", "55", "0.92"),
+        ("MLBB_GLOBAL_Diamond_Pass", "Diamond Pass", "0.94"),
+        ("MLBB_GLOBAL_59", "59", "0.98"),
+        ("MLBB_GLOBAL_85", "85", "1.41"),
+        ("MLBB_GLOBAL_Weekly", "Weekly", "1.79"),
+        ("MLBB_GLOBAL_165", "165", "2.74"),
+        ("MLBB_GLOBAL_170", "170", "2.83"),
+        ("MLBB_GLOBAL_240", "240", "4.01"),
+        ("MLBB_GLOBAL_Monthly_Elite_Pack", "Monthly Elite Pack", "4.58"),
+        ("MLBB_GLOBAL_275", "275", "4.58"),
+        ("MLBB_GLOBAL_296", "296", "4.92"),
+        ("MLBB_GLOBAL_408", "408", "6.77"),
+        ("MLBB_GLOBAL_Twilight", "Twilight", "9.21"),
+        ("MLBB_GLOBAL_565", "565", "9.21"),
+        ("MLBB_GLOBAL_568", "568", "9.24"),
+        ("MLBB_GLOBAL_875", "875", "14.17"),
+        ("MLBB_GLOBAL_2010", "2010", "30.80"),
+        ("MLBB_GLOBAL_4830", "4830", "73.88"),
+    ]
+    c = conn()
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            (MOBILE_LEGENDS_GLOBAL_GAME_ID, "Mobile Legends Global", "User ID", 1, 0, 1,
+             datetime.now().isoformat(), "mlbb_global", json.dumps(["user_id", "server_id"]))
+        )
+        rate = get_bay2game_usd_uzs()
+        for code, title, usd_text in global_products:
+            usd = Decimal(usd_text)
+            api_uzs = usd * rate
+            sale_price = calc_sale_price(api_uzs)
+            c.execute(
+                "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (MOBILE_LEGENDS_GLOBAL_GAME_ID, bay2game_internal_id(code),
+                 "Mobile Legends Global", title, float(usd), float(api_uzs),
+                 float(sale_price), 1, datetime.now().isoformat(), code)
+            )
+        c.commit()
+    finally:
+        c.close()
+
+
 def add_one_calendar_month(value):
     """Sana/vaqtni keyingi kalendar oyga o'tkazadi; kun bo'lmasa oy oxiriga moslaydi."""
     import calendar
@@ -7731,6 +7782,7 @@ def main():
 
     ensure_pubg()
     ensure_mobile_legends()
+    ensure_mobile_legends_global_catalog()
 
     # Eski PlayPay katalogi Bay2Game product_code bo'lmagan holda sotuvga chiqmasin.
     # Bay2Game katalogi admin panelidagi "Katalog" tugmasi orqali yangilanadi.
