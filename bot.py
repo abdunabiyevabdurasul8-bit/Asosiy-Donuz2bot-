@@ -1466,7 +1466,6 @@ def build_application(token, child=False):
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("omonatfoiz", omonat_foiz_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CallbackQueryHandler(subscription_check_callback, pattern=r"^donuz_sub_check$"))
     app.add_handler(CallbackQueryHandler(callback_router))
@@ -1798,7 +1797,7 @@ async def bay2game_telegram_game(update, context, game_id):
     finally:
         c.close()
     if not game or not products:
-        await q.message.reply_text("❌ Bay2Game katalogida paket topilmadi. Admin katalogni yangilasin.")
+        await q.message.reply_text("❌ Paketlar topilmadi. Admin katalogni yangilasin.")
         return
     context.user_data.clear()
     rows = []
@@ -2263,6 +2262,9 @@ def bay2game_game_internal_id(game_code, name=""):
             return PUBG_GLOBAL_GAME_ID
         return PUBG_GAME_ID
     if "mobilelegends" in label or "mobilelegend" in label or label in ("mlbb",):
+        if "global" in label:
+            # Global uchun alohida, API game_code ga bog'langan barqaror ID.
+            return bay2game_internal_id("mobile_legends_global:" + code)
         return MOBILE_LEGENDS_GAME_ID
     if "grandmobile" in label:
         return GRAND_MOBILE_GAME_ID
@@ -2502,12 +2504,12 @@ def bay2game_create_order(product_code, player_id, server_id=""):
 def api_post_no_idempotency(path, body):
     if path == "/check_id":
         return playpay_check_id(body.get("game_id"), body.get("player_id"), body.get("server_id"), body.get("charname"))
-    return 400, {"ok": False, "error": "Bay2Game bu endpointni qo'llamaydi."}
+    return 400, {"ok": False, "error": "Bu xizmat hozircha mavjud emas."}
 
 
 def api_post(path, body):
     if path != "/order":
-        return 400, {"ok": False, "error": "Bay2Game endpointi topilmadi."}
+        return 400, {"ok": False, "error": "Xizmat manzili topilmadi."}
     try:
         game_id = int(body.get("game_id"))
         paket_id = int(body.get("paket_id"))
@@ -2520,7 +2522,7 @@ def api_post(path, body):
         ).fetchone()
         c.close()
         if not product or not product["provider_product_code"]:
-            return 400, {"ok": False, "error": "Bay2Game product_code topilmadi. Katalogni yangilang."}
+            return 400, {"ok": False, "error": "Mahsulot kodi topilmadi. Katalogni yangilang."}
         return bay2game_create_order(product["provider_product_code"], player_id, server_id)
     except Exception as exc:
         log.exception("Bay2Game order adapter xatosi")
@@ -2835,7 +2837,7 @@ def sync_catalog():
     """Bay2Game categories va products katalogini yangilaydi."""
     categories = get_games_api()
     if not categories:
-        return False, "Bay2Game katalogi olinmadi. API key va API balansini tekshiring."
+        return False, "Katalogni yangilab bo‘lmadi. Texnik sozlamalarni tekshiring."
 
     game_count = 0
     product_count = 0
@@ -2905,8 +2907,9 @@ def sync_catalog():
         # API qaytargan o'yinlarni to'liq ko'rsatamiz; nomi PUBG Delay bo'lsa ham yashirmaymiz.
         # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
         region = str(category.get("region") or category.get("server") or category.get("version") or "").strip()
-        if "pubg" in name.lower() and region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
-            name = f"{name} Global"
+        if region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
+            if "pubg" in name.lower() or "mobile legends" in name.lower() or "mlbb" in name.lower():
+                name = f"{name} Global"
         if not game_code:
             continue
         gid = bay2game_game_internal_id(game_code, name)
@@ -2977,8 +2980,8 @@ def sync_catalog():
                 except Exception: pass
 
     if game_count == 0:
-        return False, "Bay2Game katalogida saqlash mumkin bo'lgan o'yin topilmadi."
-    return True, f"✅ Bay2Game: {game_count} ta o'yin, {product_count} ta paket yangilandi. Kurs: 1 USD = {get_bay2game_usd_uzs():,.0f} so'm."
+        return False, "Katalogda saqlash mumkin bo'lgan o'yin topilmadi."
+    return True, f"✅ {game_count} ta o'yin, {product_count} ta paket yangilandi."
 
 
 def add_one_calendar_month(value):
@@ -3054,130 +3057,6 @@ def omonat_worker():
             log.exception("Omonat worker xatosi")
         import time
         time.sleep(30)
-
-
-async def omonat_menu(update, context):
-    q = update.callback_query
-    uid = q.from_user.id
-    process_due_omonats(notify=True)
-    c = main_conn()
-    active = c.execute(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(principal),0) AS total FROM omonats WHERE user_id=? AND status='active'",
-        (uid,)
-    ).fetchone()
-    c.close()
-    await q.message.reply_text(
-        "🏦 OMONAT\n\n"
-        f"📈 Oylik foyda: {get_setting('omonat_profit_percent', '1')}%\n"
-        "🗓 Muddat: 1 kalendar oy\n"
-        "⏰ Foyda omonat ochilgan vaqtga mos ravishda bir oy o'tgach hisoblanadi.\n"
-        "✅ Muddat tugaganda asosiy summa va foyda balansga bir marta qaytariladi.\n"
-        "⚠️ Muddatidan oldin yopilsa, faqat asosiy summa qaytadi; foyda hisoblanmaydi.\n\n"
-        f"💰 Balans: {get_balance(uid):,.0f} so'm\n"
-        f"📂 Faol omonatlar: {int(active['n'])}\n"
-        f"🔒 Omonatdagi summa: {float(active['total']):,.0f} so'm",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Omonat ochish", callback_data="omonat_open")],
-            [InlineKeyboardButton("📜 Omonat tarixi", callback_data="omonat_history")],
-            [InlineKeyboardButton("⬅️ Asosiy menyu", callback_data="back_home")],
-        ])
-    )
-
-
-async def omonat_open_start(update, context):
-    q = update.callback_query
-    context.user_data["state"] = "omonat_amount"
-    await q.message.reply_text(
-        "➕ Omonat ochish\n\n"
-        f"💰 Balansingiz: {get_balance(q.from_user.id):,.0f} so'm\n"
-        "Omonatga qo'ymoqchi bo'lgan summani yuboring (so'mda).\n"
-        "Bekor qilish: /cancel"
-    )
-
-
-async def omonat_history(update, context):
-    q = update.callback_query
-    uid = q.from_user.id
-    process_due_omonats(notify=True)
-    c = main_conn()
-    rows = c.execute(
-        "SELECT * FROM omonats WHERE user_id=? ORDER BY id DESC LIMIT 15",
-        (uid,)
-    ).fetchall()
-    c.close()
-    if not rows:
-        return await q.message.reply_text(
-            "📜 Omonat tarixi hozircha bo'sh.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Omonat", callback_data="omonat")]])
-        )
-    lines = ["📜 OMONAT TARIXI\n"]
-    buttons = []
-    for row in rows:
-        started = datetime.fromisoformat(row["started_at"]).strftime("%d.%m.%Y %H:%M")
-        matures = datetime.fromisoformat(row["matures_at"]).strftime("%d.%m.%Y %H:%M")
-        status = {"active": "🟡 Faol", "matured": "✅ Muddat tugadi", "closed": "⚪ Erta yopildi"}.get(row["status"], row["status"])
-        lines.append(
-            f"\n#{row['id']} — {status}\n"
-            f"💰 Summa: {float(row['principal']):,.0f} so'm\n"
-            f"📈 Kutilgan foyda: {float(row['profit']):,.0f} so'm\n"
-            f"🗓 Ochilgan: {started}\n"
-            f"⏰ Muddat: {matures}"
-        )
-        if row["status"] == "active":
-            buttons.append([InlineKeyboardButton(f"🔒 #{row['id']} omonatni yopish", callback_data=f"omonat_close_{row['id']}")])
-    buttons.append([InlineKeyboardButton("⬅️ Omonat", callback_data="omonat")])
-    await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def omonat_close_prompt(update, context, omonat_id):
-    q = update.callback_query
-    c = main_conn()
-    row = c.execute("SELECT * FROM omonats WHERE id=? AND user_id=? AND status='active'", (omonat_id, q.from_user.id)).fetchone()
-    c.close()
-    if not row:
-        return await q.message.reply_text("❌ Faol omonat topilmadi yoki u allaqachon yopilgan.")
-    await q.message.reply_text(
-        f"⚠️ #{omonat_id} omonatni muddatidan oldin yopmoqchimisiz?\n\n"
-        f"💰 Qaytariladigan asosiy summa: {float(row['principal']):,.0f} so'm\n"
-        "📉 Muddatidan oldin yopilgani uchun foyda berilmaydi.\n\n"
-        "Yopishni tasdiqlaysizmi?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Ha, yopish", callback_data=f"omonat_close_yes_{omonat_id}")],
-            [InlineKeyboardButton("❌ Yo'q", callback_data="omonat_history")],
-        ])
-    )
-
-
-async def omonat_close_confirm(update, context, omonat_id):
-    q = update.callback_query
-    now = datetime.now().isoformat()
-    c = main_conn()
-    try:
-        c.execute("BEGIN IMMEDIATE")
-        row = c.execute("SELECT * FROM omonats WHERE id=? AND user_id=? AND status='active'", (omonat_id, q.from_user.id)).fetchone()
-        if not row:
-            c.rollback()
-            return await q.message.reply_text("❌ Omonat allaqachon yopilgan yoki topilmadi.")
-        # Agar worker bu vaqt ichida muddati yetgan omonatni qaytargan bo'lsa, ikkinchi to'lov bo'lmaydi.
-        if row["matures_at"] <= now:
-            c.rollback()
-            process_due_omonats(notify=True)
-            return await q.message.reply_text("⏰ Omonat muddati tugagan. Asosiy summa va foyda balansga qaytarildi.")
-        amount = float(row["principal"])
-        c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, q.from_user.id))
-        c.execute("INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)", (q.from_user.id, amount, "omonat_early_close", f"Omonat #{omonat_id}: muddatidan oldin yopildi", now))
-        c.execute("UPDATE omonats SET status='closed', closed_at=? WHERE id=? AND status='active'", (now, omonat_id))
-        c.commit()
-    except Exception:
-        c.rollback()
-        log.exception("Omonatni yopishda xatolik")
-        return await q.message.reply_text("❌ Omonatni yopib bo'lmadi. Keyinroq urinib ko'ring.")
-    finally:
-        c.close()
-    await q.message.reply_text(
-        f"✅ Omonat #{omonat_id} yopildi.\n\n💰 Balansga qaytarildi: {amount:,.0f} so'm\n📈 Foyda hisoblanmadi.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📜 Omonat tarixi", callback_data="omonat_history")], [InlineKeyboardButton("⬅️ Omonat", callback_data="omonat")]])
-    )
 
 
 # ============================================================
@@ -3316,7 +3195,6 @@ def main_menu():
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
         [InlineKeyboardButton("💳 Balans to'ldirish", callback_data="deposit")],
         [InlineKeyboardButton("💸 Pul o'tkazish", callback_data="transfer_start")],
-        [InlineKeyboardButton("🏦 Omonat", callback_data="omonat")],
         [InlineKeyboardButton("💸 Balans yechish", callback_data="withdraw")],
         [InlineKeyboardButton("🔗 Referal", callback_data="referral")],
         [InlineKeyboardButton("📦 Buyurtmalarim", callback_data="orders")],
@@ -3385,9 +3263,7 @@ def admin_kb(context=None):
         ],
     ]
     if show_platform_controls:
-        rows.insert(6, [InlineKeyboardButton("💱 Bay2Game USD kursi", callback_data="adm_bay2game_rate")])
         rows.append([InlineKeyboardButton("🔄 Katalog", callback_data="a_sync")])
-        rows.append([InlineKeyboardButton("🔐 Bay2Game balansi", callback_data="adm_playpay_balance")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -4382,7 +4258,7 @@ async def confirm(update, context):
         uid,
         -price,
         "order_hold",
-        f"Bay2Game buyurtma: {game_id}/{paket_id}"
+        f"Buyurtma: {game_id}/{paket_id}"
     )
 
     # ========================================================
@@ -4401,8 +4277,7 @@ async def confirm(update, context):
             uid,
             price,
             "order_refund",
-            "Bay2Game API xatosi: "
-            f"{data.get('error','unknown')}"
+            "Buyurtma bajarilmadi; summa mijoz balansiga qaytarildi."
         )
 
         # Foydalanuvchiga provider/API yoki sayt nomi ko'rsatilmaydi.
@@ -4506,7 +4381,7 @@ async def confirm(update, context):
             f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
             f"🆔 O'yinchi ID: {player_id}\n"
             + (f"🌐 Server ID: {server_id}\n" if requires_server else "")
-            + f"💰 Summa: {price:,.0f} so'm\n🔢 Donuz ID: {playpay_id or '-'}\n📊 Holat: {order_status}"
+            + f"💰 Summa: {price:,.0f} so'm\n🔢 Buyurtma ID: {playpay_id or '-'}\n📊 Holat: {order_status}"
         )
         await notify_order_channel(context, _channel_notice)
     except Exception:
@@ -4866,70 +4741,6 @@ async def text_handler(update, context):
         c=main_conn(); c.execute("UPDATE child_bots SET markup_uzs=? WHERE bot_id=? AND owner_user_id=?",(float(amount),bot_id,u.id)); c.commit(); c.close()
         context.user_data.clear()
         await update.message.reply_text(f"✅ Ustama saqlandi: {amount:,.0f} so'm",reply_markup=main_menu())
-        return
-
-    # ========================================================
-    # OMONAT SUMMASI
-    # ========================================================
-
-    if state == "omonat_amount":
-        try:
-            amount = Decimal(text.replace(",", "").replace(" ", ""))
-        except InvalidOperation:
-            await update.message.reply_text("❌ Summani raqamda yuboring. Masalan: 50000")
-            return
-        if amount <= 0 or amount != amount.to_integral_value():
-            await update.message.reply_text("❌ Summani musbat butun so'mda yuboring.")
-            return
-        amount = amount.quantize(Decimal("1"))
-        uid = u.id
-        balance = get_balance(uid)
-        if balance < amount:
-            await update.message.reply_text(
-                f"❌ Balans yetarli emas.\n💰 Kerak: {amount:,.0f} so'm\n💳 Balans: {balance:,.0f} so'm"
-            )
-            return
-        started = datetime.now()
-        matures = add_one_calendar_month(started)
-        try:
-            profit_percent = Decimal(str(get_setting("omonat_profit_percent", "1")))
-        except Exception:
-            profit_percent = Decimal("1")
-        profit = (amount * profit_percent / Decimal("100")).quantize(Decimal("1"))
-        c = main_conn()
-        try:
-            c.execute("BEGIN IMMEDIATE")
-            user_row = c.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
-            if not user_row or Decimal(str(user_row["balance"] or 0)) < amount:
-                c.rollback()
-                await update.message.reply_text("❌ Balans yetarli emas. Balansingizni tekshirib qayta urinib ko'ring.")
-                return
-            c.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (float(amount), uid))
-            c.execute("INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)", (uid, -float(amount), "omonat_open", "Omonat ochildi", started.isoformat()))
-            cur = c.execute("INSERT INTO omonats(user_id,principal,profit,status,started_at,matures_at) VALUES(?,?,?,'active',?,?)", (uid, float(amount), float(profit), started.isoformat(), matures.isoformat()))
-            omonat_id = cur.lastrowid
-            c.commit()
-        except Exception:
-            c.rollback()
-            log.exception("Omonat ochishda xatolik")
-            await update.message.reply_text("❌ Omonat ochilmadi. Qayta urinib ko'ring.")
-            return
-        finally:
-            c.close()
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Omonat #{omonat_id} ochildi!\n\n"
-            f"💰 Summa: {amount:,.0f} so'm\n"
-            f"📈 {profit_percent}% foyda: {profit:,.0f} so'm\n"
-            f"💵 Muddat tugaganda jami: {amount + profit:,.0f} so'm\n"
-            f"🗓 Ochilgan: {started.strftime('%d.%m.%Y %H:%M:%S')}\n"
-            f"⏰ Tugash vaqti: {matures.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
-            "Muddat tugaganda summa va foyda balansingizga avtomatik qaytariladi.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📜 Omonat tarixi", callback_data="omonat_history")],
-                [InlineKeyboardButton("🏦 Omonat menyusi", callback_data="omonat")]
-            ])
-        )
         return
 
     # ========================================================
@@ -5638,7 +5449,7 @@ async def orders_cb(update, context):
         text += (
             f"💰 {r['sale_price']:,.0f} so'm\n"
             f"📊 {r['status']}\n"
-            f"🔢 Bay2Game: "
+            f"🔢 Buyurtma ID: "
             f"{r['playpay_order_id']}\n"
             f"🕐 {r['created_at']}\n\n"
         )
@@ -5676,48 +5487,6 @@ async def promo_cb(update, context):
 # ============================================================
 # ADMIN COMMAND
 # ============================================================
-
-async def omonat_foiz_command(update, context):
-    """Admin: /omonatfoiz 2.5 — yangi omonatlar uchun oylik foiz."""
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
-        return
-    if not context.args:
-        current = get_setting("omonat_profit_percent", "1")
-        await update.message.reply_text(
-            f"Hozirgi omonat foizi: {current}%\n"
-            "O'zgartirish: /omonatfoiz 2.5\n"
-            "Yangi foiz faqat keyin ochiladigan omonatlarga ta'sir qiladi."
-        )
-        return
-    try:
-        rate = Decimal(context.args[0].replace(",", "."))
-    except Exception:
-        return await update.message.reply_text("Foizni raqamda kiriting. Masalan: /omonatfoiz 2.5")
-    if rate < 0 or rate > 100:
-        return await update.message.reply_text("Foiz 0 dan 100 gacha bo'lishi kerak.")
-    set_setting("omonat_profit_percent", str(rate.normalize()))
-    await update.message.reply_text(
-        f"✅ Omonat foizi saqlandi: {rate.normalize()}%\n"
-        "Bu sozlama yangi omonatlarga qo'llanadi."
-    )
-
-
-async def admin_command(update, context):
-
-    set_request_db(context)
-    if update.effective_user.id != bot_admin_id(context):
-
-        await update.message.reply_text(
-            "❌ Siz admin emassiz."
-        )
-
-        return
-
-    await update.message.reply_text(
-        "👑 ADMIN PANEL",
-        reply_markup=admin_kb(context)
-    )
-
 
 # ============================================================
 # ADMIN STATS
@@ -6152,7 +5921,7 @@ async def admin_orders(update, context):
             f"💰 Sotuv: "
             f"{r['sale_price']:,.0f} so'm\n"
             f"📊 {r['status']}\n"
-            f"🔢 Bay2Game: "
+            f"🔢 Buyurtma ID: "
             f"{r['playpay_order_id']}\n"
             f"🕐 {r['created_at']}\n\n"
         )
@@ -6399,34 +6168,6 @@ async def admin_text_handler(update, context):
     if not state:
 
         return False
-
-    # ========================================================
-    # BAY2GAME USD KURSI
-    # ========================================================
-    if state == "bay2game_usd_uzs":
-        try:
-            rate = Decimal(text.replace(" ", "").replace(",", ".").replace("so'm", ""))
-        except Exception:
-            await update.message.reply_text("❌ Kursni raqamda yuboring. Masalan: 13000")
-            return True
-        if rate < 1 or rate > 100000000:
-            await update.message.reply_text("❌ Kurs 1 dan 100 000 000 so'mgacha bo'lishi kerak.")
-            return True
-        set_setting("bay2game_usd_uzs", str(rate))
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Bay2Game USD kursi saqlandi: 1 USD = {rate:,.2f} so'm\n"
-            "🔄 Katalog va paket narxlari yangilanmoqda..."
-        )
-        ok, result = await asyncio.to_thread(sync_catalog)
-        if ok:
-            await asyncio.to_thread(sync_all_child_catalogs)
-        await update.message.reply_text(
-            f"{'✅' if ok else '⚠️'} {result}\n\n"
-            "Yangi kurs katalogdagi Bay2Game paketlariga qo'llandi.",
-            reply_markup=admin_kb(context)
-        )
-        return True
 
     # ========================================================
     # REFERAL BONUSI
@@ -7294,7 +7035,7 @@ async def admin_callback(update, context):
 
     d = q.data
 
-    platform_only_callbacks = {"adm_bay2game_rate", "adm_playpay_balance", "a_sync"}
+    platform_only_callbacks = {"a_sync"}
     if d in platform_only_callbacks and (is_child_bot(context) or q.from_user.id != ADMIN_ID):
         await q.answer("Xatolik", show_alert=True)
         return
@@ -7483,92 +7224,6 @@ async def admin_callback(update, context):
             context
         )
 
-    elif d == "adm_bay2game_rate":
-        if q.from_user.id != bot_admin_id(context):
-            await q.answer("Siz admin emassiz.", show_alert=True)
-            return
-        current_rate = get_bay2game_usd_uzs()
-        context.user_data.clear()
-        context.user_data["admin_state"] = "bay2game_usd_uzs"
-        await q.message.reply_text(
-            "💱 BAY2GAME USD KURSI\n\n"
-            f"Hozirgi kurs: 1 USD = {current_rate:,.2f} so'm\n\n"
-            "Yangi kursni so'mda yuboring.\n"
-            "Masalan: 13000\n\n"
-            "Kurs saqlangach katalogdagi paketlar narxi avtomatik yangilanadi."
-        )
-
-    elif d == "adm_playpay_balance":
-
-        status, data = await asyncio.to_thread(
-            get_playpay_balance
-        )
-
-        if data.get("ok"):
-
-            b = data.get("balance", {})
-            if not isinstance(b, dict):
-                b = {"amount": b, "currency": "USD"}
-            profile = data.get("profile", {})
-            if not isinstance(profile, dict):
-                profile = {}
-            # Ba'zi Bay2Game javoblarida maydonlar profile ichida, boshqalarida root darajada keladi.
-            raw = data.get("raw", {}) if isinstance(data.get("raw"), dict) else {}
-            def pval(*keys, default="—"):
-                for source in (profile, raw):
-                    for key in keys:
-                        value = source.get(key)
-                        if value not in (None, ""):
-                            return value
-                return default
-            amount = b.get('amount', b.get('usd', '0'))
-            currency = b.get('currency', 'USD')
-            telegram_id = pval("telegram_id", "user_id", "id")
-            username = pval("username", "user_name")
-            role = pval("role", default="reseller")
-            profile_balance = pval("balance", "balance_usd", "api_balance", default=amount)
-            if isinstance(profile_balance, dict):
-                profile_balance = profile_balance.get("amount", profile_balance.get("usd", amount))
-            profile_balance_text = str(profile_balance)
-            if "USD" not in profile_balance_text.upper() and not profile_balance_text.startswith("$"):
-                profile_balance_text = f"${profile_balance_text} USD"
-            elif not profile_balance_text.startswith("$"):
-                profile_balance_text = "$" + profile_balance_text
-            total_orders = pval("total_orders", "orders_count", "orders", default=0)
-            total_spent = pval("total_spent", "spent", "spent_usd", default=0)
-            spent_text = str(total_spent)
-            if "USD" not in spent_text.upper() and not spent_text.startswith("$"):
-                spent_text = f"${spent_text}"
-            elif not spent_text.startswith("$"):
-                spent_text = "$" + spent_text
-            joined = pval("joined", "joined_at", "created_at", default="—")
-            profile_status = str(pval("status", default="active")).lower()
-            status_text = "✅ Active" if profile_status in ("active", "enabled", "ok", "true", "1") else f"⚠️ {profile_status.title()}"
-            profile_text = (
-                "\n\n👤 My Profile\n\n"
-                f"┌ 🆔 Telegram ID: {telegram_id}\n"
-                f"├ 📝 Username: {('@' + str(username).lstrip('@')) if username != '—' else '—'}\n"
-                f"├ 👑 Role: {role}\n"
-                f"├ 💰 Balance: {profile_balance_text}\n"
-                f"├ 📊 Status: {status_text}\n"
-                f"├ 🛍️ Total Orders: {total_orders}\n"
-                f"├ 💸 Total Spent: {spent_text}\n"
-                f"└ 📅 Joined: {joined}"
-            )
-            await q.message.reply_text(
-                f"🔐 BAY2GAME BALANSI\n\n"
-                f"💵 USD: {amount}\n"
-                f"💱 Valyuta: {currency}\n"
-                f"💱 Kurs: 1 USD = {get_bay2game_usd_uzs():,.0f} so'm"
-                f"{profile_text}\n\n"
-                "✨ Xizmat balansini boshqarish uchun administrator bilan bog'laning.\n"
-                "💡 Yordam kerak bo'lsa, qo'llab-quvvatlashga yozing."
-            )
-
-        else:
-
-            await q.message.reply_text("❌ Xatolik")
-
     # ========================================================
     # FAQAT ADMIN KATALOG YANGILAYDI
     # ========================================================
@@ -7576,7 +7231,7 @@ async def admin_callback(update, context):
     elif d == "a_sync":
 
         await q.message.reply_text(
-            "🔄 Bay2Game katalogi yangilanmoqda..."
+            "🔄 Katalog yangilanmoqda..."
         )
 
         ok, result = await asyncio.to_thread(
@@ -7625,18 +7280,6 @@ async def callback_router(update, context):
         return await transfer_start(update, context)
     if d == "transfer_confirm":
         return await transfer_confirm(update, context)
-
-    # Omonat menyusi va tarixi
-    if d == "omonat":
-        return await omonat_menu(update, context)
-    if d == "omonat_open":
-        return await omonat_open_start(update, context)
-    if d == "omonat_history":
-        return await omonat_history(update, context)
-    if d.startswith("omonat_close_yes_"):
-        return await omonat_close_confirm(update, context, int(d.rsplit("_", 1)[1]))
-    if d.startswith("omonat_close_"):
-        return await omonat_close_prompt(update, context, int(d.rsplit("_", 1)[1]))
 
     # Telegram Stars / Premium — faqat ikkita aniq xizmat tanlovi.
     if d == "telegram_services":
@@ -8011,7 +7654,7 @@ def main():
     if Fernet is None:
         raise SystemExit("❌ cryptography o'rnatilmagan. requirements.txt ga cryptography qo'shing.")
 
-    # Omonat muddatlarini fon rejimida tekshirish (har 30 soniyada).
+    # Eski faol omonatlar bo‘lsa, muddatida asosiy summani qaytarish uchun worker saqlanadi.
     threading.Thread(target=omonat_worker, daemon=True, name="omonat-worker").start()
 
     # --------------------------------------------------------
