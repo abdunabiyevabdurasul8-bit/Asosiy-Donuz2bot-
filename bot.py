@@ -114,7 +114,7 @@ class PGConnection:
             # Tables with generated integer ids only; other inserts need no lastrowid.
             if table.lower() in {'payments','orders','withdrawals','balance_history','omonats','external_orders','web_auth_codes','web_orders'}:
                 query += " RETURNING id"
-        cur.execute(query, params if params else None)
+        cur.execute(query, params or ())
         last_id=None
         if " RETURNING id" in query.upper():
             row=cur.fetchone()
@@ -445,17 +445,11 @@ def web_session_user(token):
     return int(row["user_id"]) if row else None
 
 
-def is_roblox_game_name(value):
-    """Faqat Roblox nomli o'yinlarni ruxsat qiladi."""
-    text = re.sub(r"[^a-z0-9]", "", str(value or "").lower())
-    return "roblox" in text
-
-
 def web_catalog():
     c = main_conn()
     games = c.execute(
         "SELECT game_id,name,id_label,requires_server,amount_based "
-        "FROM games WHERE active=1 AND LOWER(name) LIKE '%roblox%' ORDER BY game_id"
+        "FROM games WHERE active=1 ORDER BY game_id"
     ).fetchall()
     result = []
 
@@ -489,6 +483,24 @@ def web_catalog():
 
     c.close()
 
+    # Grand Mobile manual katalogi
+    result.append({
+        "game_id": GRAND_MOBILE_GAME_ID,
+        "name": "Grand Mobile",
+        "id_label": "Grand Mobile ID",
+        "requires_server": False,
+        "amount_based": False,
+        "manual": True,
+        "packages": [
+            {
+                "paket_id": int(gc),
+                "name": f"{gc} GC",
+                "api_price_uzs": float(price),
+                "price": float(price),
+            }
+            for gc, price in GRAND_MOBILE_PRICES.items()
+        ],
+    })
     return result
 
 
@@ -500,12 +512,6 @@ def web_check_id(payload):
 
     if not player_id:
         return {"ok": False, "error": "ID kiritilmagan."}
-
-    c = main_conn()
-    game_row = c.execute("SELECT name FROM games WHERE game_id=? AND active=1", (game_id,)).fetchone()
-    c.close()
-    if not game_row or not is_roblox_game_name(game_row["name"]):
-        return {"ok": False, "error": "Faqat Roblox buyurtmalariga ruxsat berilgan."}
 
     if game_id == GRAND_MOBILE_GAME_ID:
         return {
@@ -542,11 +548,6 @@ def web_create_order(payload, user_id):
         return {"ok": False, "error": "ID kiritilmagan."}
 
     c = main_conn()
-    allowed_game = c.execute("SELECT name FROM games WHERE game_id=? AND active=1", (game_id,)).fetchone()
-    if not allowed_game or not is_roblox_game_name(allowed_game["name"]):
-        c.close()
-        return {"ok": False, "error": "Faqat Roblox buyurtmalariga ruxsat berilgan."}
-
     p = c.execute(
         "SELECT * FROM products WHERE game_id=? AND paket_id=? AND active=1",
         (game_id, paket_id)
@@ -970,7 +971,6 @@ def init_db():
         PAYMENT_CARD
     )
     set_default("donat_markup_percent", DEFAULT_MARKUP)
-    set_default("roblox_markup_percent", "0")
     set_default("bay2game_usd_uzs", os.getenv("BAY2GAME_USD_UZS", "13000"))
     set_default("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)
     set_default("stars_unit_price_uzs", "0")
@@ -2596,10 +2596,9 @@ def calc_sale_price(api_uzs):
         price = Decimal("0")
 
     try:
-        # Roblox ustamasi alohida boshqariladi; boshqa donat ustamasidan mustaqil.
-        markup = Decimal(str(get_setting("roblox_markup_percent", "0")))
+        markup = Decimal(str(get_setting("donat_markup_percent", DEFAULT_MARKUP)))
     except Exception:
-        markup = Decimal("0")
+        markup = DEFAULT_MARKUP
 
     sale = price * (
         Decimal("1")
@@ -2848,94 +2847,209 @@ def telegram_stars_amount(product_code="", package_name=""):
 
 
 def sync_catalog():
-    """Katalogdan faqat Roblox o'yini va uning paketlarini saqlaydi."""
+    """Bay2Game categories va products katalogini yangilaydi."""
     categories = get_games_api() or []
-    roblox_categories = []
-    for category in categories:
-        if not isinstance(category, dict):
-            continue
-        name = str(category.get("name") or category.get("game_name") or category.get("gameName") or category.get("category_name") or category.get("title") or category.get("slug") or "").strip()
-        code = str(category.get("game_code") or category.get("gameCode") or category.get("category_code") or category.get("categoryCode") or category.get("game_id") or category.get("category_id") or category.get("code") or category.get("slug") or category.get("id") or "").strip()
-        if is_roblox_game_name(name) or is_roblox_game_name(code):
-            category["_roblox_name"] = name or "Roblox"
-            category["_roblox_code"] = code
-            roblox_categories.append(category)
-
-    if not roblox_categories:
-        log.warning("API katalogida Roblox topilmadi; mavjud Roblox katalogi saqlab qolindi.")
-        return False, "❌ API katalogida Roblox topilmadi. Boshqa o'yinlar qo'shilmadi."
 
     game_count = 0
     product_count = 0
-    now = datetime.now().isoformat()
+    # Katalogni yangilash mavjud o'yinlarni o'chirib qo'ymasligi kerak.
+    # API javobida vaqtincha ko'rinmay qolgan PUBG / Mobile Legends ham saqlanadi.
 
-    c = conn()
-    try:
-        c.execute("UPDATE games SET active=0 WHERE LOWER(name) NOT LIKE '%roblox%'")
-        c.execute("""UPDATE products SET active=0
-                     WHERE game_id IN (SELECT game_id FROM games WHERE LOWER(name) NOT LIKE '%roblox%')""")
-        c.commit()
-    finally:
-        c.close()
+    # PUBG umumiy katalog javobida tushib qolsa, API qidiruvi orqali ham izlaymiz.
+    pubg_in_catalog = any(
+        isinstance(item, dict) and "pubg" in str(
+            item.get("name") or item.get("game_name") or item.get("category_name") or item.get("title") or ""
+        ).lower()
+        for item in categories
+    )
+    # PUBG Global API katalogida alohida nom bilan bo'lsa, uni ham izlaymiz.
+    # API uni alohida qaytarmasa, oddiy PUBG mahsulotini Global deb taxmin qilmaymiz.
+    if not pubg_in_catalog or not any(
+        isinstance(item, dict) and "pubg" in str(
+            item.get("name") or item.get("game_name") or item.get("category_name") or item.get("title") or ""
+        ).lower() and "global" in str(
+            item.get("name") or item.get("game_name") or item.get("category_name") or item.get("title") or ""
+        ).lower()
+        for item in categories
+    ):
+        for search_term in ("pubg global", "pubg"):
+            # API logida /games 404 qaytargani uchun faqat mavjudligi tasdiqlangan
+            # /categories endpointidan foydalanamiz; noma'lum endpointni chaqirmaymiz.
+            st, response = bay2game_request("/categories", {"search": search_term, "q": search_term})
+            if st and response.get("ok"):
+                options = []
+                for key in ("categories", "games", "items", "results", "data"):
+                    val = response.get(key)
+                    if isinstance(val, list):
+                        options.extend(x for x in val if isinstance(x, dict))
+                    elif isinstance(val, dict):
+                        for inner in ("categories", "games", "items", "results", "data"):
+                            sub = val.get(inner)
+                            if isinstance(sub, list):
+                                options.extend(x for x in sub if isinstance(x, dict))
+                pubg_options = [
+                    x for x in options
+                    if "pubg" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()
+                    and "delay" not in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()
+                ]
+                if search_term == "pubg global":
+                    pubg_options = [x for x in pubg_options if "global" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()]
+                if pubg_options:
+                    categories.extend(pubg_options)
+                    break
+            if search_term == "pubg" and any(
+                "global" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()
+                for x in categories if isinstance(x, dict)
+            ):
+                break
 
-    for category in roblox_categories:
-        game_code = category["_roblox_code"]
-        name = category["_roblox_name"]
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        game_code = str(
+            category.get("game_code") or category.get("gameCode") or category.get("category_code") or
+            category.get("categoryCode") or category.get("game_id") or category.get("category_id") or
+            category.get("code") or category.get("slug") or category.get("id") or ""
+        ).strip()
+        name = str(
+            category.get("name") or category.get("game_name") or category.get("gameName") or
+            category.get("category_name") or category.get("title") or category.get("slug") or game_code
+        ).strip()
+        # API qaytargan o'yinlarni to'liq ko'rsatamiz; nomi PUBG Delay bo'lsa ham yashirmaymiz.
+        # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
+        region = str(category.get("region") or category.get("server") or category.get("version") or "").strip()
+        if region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
+            if any(term in name.lower() for term in ("pubg", "mobile legends", "mobilelegend", "mlbb")):
+                name = f"{name} Global"
         if not game_code:
             continue
         gid = bay2game_game_internal_id(game_code, name)
         fields = category.get("game_fields") or category.get("gameFields") or category.get("fields") or category.get("required_fields") or category.get("input_fields") or []
-        c = conn()
+        names = _field_names(fields)
+        requires_server = "serverid" in names or "zoneid" in names or "gamezoneid" in names
+        id_label = "User ID" if "userid" in names else "Player ID"
         try:
+            c = conn()
             c.execute(
                 "INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) VALUES(?,?,?,?,?,?,?,?,?)",
-                (gid, "Roblox", "Roblox Username / ID", 0, 0, 1, now, game_code, json.dumps(fields, ensure_ascii=False))
+                (gid, name, id_label, 1 if requires_server else 0, 0, 1, datetime.now().isoformat(), game_code, json.dumps(fields, ensure_ascii=False)),
             )
             c.commit()
-            game_count += 1
-        finally:
             c.close()
+            game_count += 1
+        except Exception:
+            log.exception("Bay2Game game saqlash xatosi: %s", game_code)
+            try: c.close()
+            except Exception: pass
+            continue
 
-        package_data = get_packages_api(gid) or {}
-        packages = package_data.get("packages", []) if isinstance(package_data, dict) else []
-        for product in packages:
-            if not isinstance(product, dict):
-                continue
-            product_code = str(product.get("product_code") or "").strip()
-            if not product_code:
-                continue
+        data = get_packages_api(gid)
+        if not data:
+            continue
+        for product in data.get("packages", []):
             try:
-                raw_price = product.get("sell_price")
-                if raw_price is None:
-                    raw_price = product.get("price_usd")
-                if raw_price is None:
-                    raw_price = product.get("price", {})
-                if isinstance(raw_price, dict):
-                    raw_price = raw_price.get("usd", raw_price.get("amount", raw_price.get("value", 0)))
-                usd = Decimal(str(raw_price or 0))
-                if usd <= 0:
+                product_code = str(product.get("product_code") or "").strip()
+                if not product_code:
                     continue
+                paket_id = bay2game_internal_id(product_code)
+                usd = Decimal(str(product.get("sell_price", product.get("price", {}).get("usd", 0)) or 0))
                 api_uzs = usd * get_bay2game_usd_uzs()
-                sale_price = calc_sale_price(api_uzs)
-                package_name = str(product.get("name") or product.get("product_name") or product.get("title") or product_code)
-                status = str(product.get("status", "active")).lower()
-                active = 0 if status in ("inactive", "disabled", "unavailable", "out_of_stock") else 1
+                package_name = str(product.get("name") or product.get("product_name") or product_code)
+                service_words = (str(name) + " " + package_name).lower()
+                if "premium" in service_words:
+                    try:
+                        markup = Decimal(str(get_setting("premium_markup_percent", TELEGRAM_MARKUP_PERCENT)))
+                    except Exception:
+                        markup = TELEGRAM_MARKUP_PERCENT
+                    sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
+                elif "star" in service_words:
+                    unit_price = Decimal(str(get_setting("stars_unit_price_uzs", "0") or "0"))
+                    stars_amount = telegram_stars_amount(product_code, package_name)
+                    if unit_price > 0 and stars_amount > 0:
+                        sale_price = (unit_price * stars_amount).quantize(Decimal("1"))
+                    else:
+                        try:
+                            markup = Decimal(str(get_setting("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)))
+                        except Exception:
+                            markup = TELEGRAM_MARKUP_PERCENT
+                        sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
+                else:
+                    sale_price = calc_sale_price(api_uzs)
+                product_status = str(product.get("status", "active")).lower()
+                active = 0 if product_status in ("inactive", "disabled", "unavailable", "out_of_stock") else 1
                 c = conn()
-                try:
-                    c.execute(
-                        "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (gid, bay2game_internal_id(product_code), "Roblox", package_name, float(usd), float(api_uzs), float(sale_price), active, now, product_code)
-                    )
-                    c.commit()
-                    product_count += 1
-                finally:
-                    c.close()
+                c.execute(
+                    "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (gid, paket_id, name, package_name, float(usd), float(api_uzs), float(sale_price), active, datetime.now().isoformat(), product_code),
+                )
+                c.commit()
+                c.close()
+                product_count += 1
             except Exception:
-                log.exception("Roblox paketi saqlashda xato: %s", product_code)
+                log.exception("Bay2Game product saqlash xatosi game=%s", game_code)
+                try: c.close()
+                except Exception: pass
+
+    # Mobile Legends Global — foydalanuvchi taqdim etgan Bay2Game SKU ro'yxati.
+    # Buyurtma endpointi product_code bilan ishlaydi; game_code taxmin qilinmaydi.
+    global_products = [
+        ("MLBB_GLOBAL_5", "5", "0.09"),
+        ("MLBB_GLOBAL_12", "12", "0.21"),
+        ("MLBB_GLOBAL_19", "19", "0.33"),
+        ("MLBB_GLOBAL_28", "28", "0.50"),
+        ("MLBB_GLOBAL_44", "44", "0.74"),
+        ("MLBB_GLOBAL_Weekly_Elite_Pack", "Weekly Elite Pack", "0.92"),
+        ("MLBB_GLOBAL_55", "55", "0.92"),
+        ("MLBB_GLOBAL_Diamond_Pass", "Diamond Pass", "0.94"),
+        ("MLBB_GLOBAL_59", "59", "0.98"),
+        ("MLBB_GLOBAL_85", "85", "1.41"),
+        ("MLBB_GLOBAL_Weekly", "Weekly", "1.79"),
+        ("MLBB_GLOBAL_165", "165", "2.74"),
+        ("MLBB_GLOBAL_170", "170", "2.83"),
+        ("MLBB_GLOBAL_240", "240", "4.01"),
+        ("MLBB_GLOBAL_Monthly_Elite_Pack", "Monthly Elite Pack", "4.58"),
+        ("MLBB_GLOBAL_275", "275", "4.58"),
+        ("MLBB_GLOBAL_296", "296", "4.92"),
+        ("MLBB_GLOBAL_408", "408", "6.77"),
+        ("MLBB_GLOBAL_Twilight", "Twilight", "9.21"),
+        ("MLBB_GLOBAL_565", "565", "9.21"),
+        ("MLBB_GLOBAL_568", "568", "9.24"),
+        ("MLBB_GLOBAL_875", "875", "14.17"),
+        ("MLBB_GLOBAL_2010", "2010", "30.80"),
+        ("MLBB_GLOBAL_4830", "4830", "73.88"),
+    ]
+    try:
+        c = conn()
+        c.execute(
+            "INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            (MOBILE_LEGENDS_GLOBAL_GAME_ID, "Mobile Legends Global", "User ID", 1, 0, 1,
+             datetime.now().isoformat(), "mlbb_global", json.dumps(["user_id", "server_id"]))
+        )
+        game_count += 1
+        usd_rate = get_bay2game_usd_uzs()
+        for product_code, title, reseller_usd in global_products:
+            usd = Decimal(reseller_usd)
+            api_uzs = usd * usd_rate
+            sale_price = calc_sale_price(api_uzs)
+            c.execute(
+                "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (MOBILE_LEGENDS_GLOBAL_GAME_ID, bay2game_internal_id(product_code),
+                 "Mobile Legends Global", title, float(usd), float(api_uzs), float(sale_price),
+                 1, datetime.now().isoformat(), product_code)
+            )
+            product_count += 1
+        c.commit()
+        c.close()
+    except Exception:
+        log.exception("Mobile Legends Global katalogini saqlashda xatolik")
+        try:
+            c.close()
+        except Exception:
+            pass
 
     if game_count == 0:
-        return False, "❌ Roblox katalogini saqlab bo'lmadi."
-    return True, f"✅ Faqat Roblox katalogi yangilandi: {game_count} ta katalog, {product_count} ta paket."
+        return False, "Katalogda saqlash mumkin bo'lgan o'yin topilmadi."
+    return True, f"✅ Katalog yangilandi: {game_count} ta o'yin, {product_count} ta paket."
 
 
 def ensure_mobile_legends_global_catalog():
@@ -3264,7 +3378,6 @@ def admin_kb(context=None):
         ],
     ]
     if show_platform_controls:
-        rows.append([InlineKeyboardButton("🎮 Roblox ustamasini sozlash", callback_data="adm_markup_roblox")])
         rows.append([InlineKeyboardButton("🔄 Katalog", callback_data="a_sync")])
     return InlineKeyboardMarkup(rows)
 
@@ -3664,10 +3777,23 @@ async def games(update, context):
         """
         SELECT *
         FROM games
-        WHERE active=1 AND LOWER(name) LIKE '%roblox%'
-        ORDER BY name
+        WHERE active=1
+        ORDER BY
+            CASE
+                WHEN game_id=? THEN 0
+                WHEN game_id=? THEN 1
+                WHEN game_id=? THEN 2
+                WHEN game_id=? THEN 3
+                ELSE 4
+            END,
+            name
         """,
-        ()
+        (
+            PUBG_GAME_ID,
+            PUBG_GLOBAL_GAME_ID,
+            MOBILE_LEGENDS_GAME_ID,
+            MOBILE_LEGENDS_GLOBAL_GAME_ID
+        )
     ).fetchall()
 
     c.close()
@@ -3686,10 +3812,18 @@ async def games(update, context):
                 """
                 SELECT *
                 FROM games
-                WHERE active=1 AND LOWER(name) LIKE '%roblox%'
-                ORDER BY name
+                WHERE active=1
+                ORDER BY
+                    CASE
+                        WHEN game_id=? THEN 0
+                        WHEN game_id=? THEN 1
+                        WHEN game_id=? THEN 2
+                        WHEN game_id=? THEN 3
+                        ELSE 4
+                    END,
+                    name
                 """,
-                ()
+                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID)
             ).fetchall()
             c.close()
 
@@ -3776,10 +3910,6 @@ async def game(update, context):
             (game_id,)
         ).fetchall()
         c.close()
-
-    if not g or not is_roblox_game_name(g["name"]):
-        await q.message.reply_text("❌ Faqat Roblox paketlaridan foydalanish mumkin.")
-        return
 
     if not g:
         await q.message.reply_text(
@@ -4115,16 +4245,6 @@ async def confirm(update, context):
         await q.answer()
     except Exception:
         pass
-
-    selected_game_name = str(
-        context.user_data.get("game_name") or
-        context.user_data.get("offer_game_name") or
-        context.user_data.get("offer_name") or ""
-    )
-    if not is_roblox_game_name(selected_game_name):
-        await q.message.reply_text("❌ Faqat Roblox buyurtmalariga ruxsat berilgan.")
-        context.user_data.clear()
-        return
 
     try:
 
@@ -6099,7 +6219,6 @@ async def admin_markup_start(update, context, kind):
         return
     labels = {
         "donat": ("🎮 Donat", "donat_markup_percent", DEFAULT_MARKUP),
-        "roblox": ("🎮 Roblox", "roblox_markup_percent", "0"),
         "sim": ("📱 SIM", "sim_markup_percent", SIM_MARKUP_PERCENT),
         "stars": ("⭐ Stars", "stars_markup_percent", TELEGRAM_MARKUP_PERCENT),
         "premium": ("💎 Premium", "premium_markup_percent", TELEGRAM_MARKUP_PERCENT),
@@ -6298,7 +6417,7 @@ async def admin_text_handler(update, context):
     # ========================================================
     # ALOHIDA USTAMALAR
     # ========================================================
-    if state in ("markup_donat", "markup_roblox", "markup_sim", "markup_stars", "markup_premium"):
+    if state in ("markup_donat", "markup_sim", "markup_stars", "markup_premium"):
         try:
             percent = Decimal(text.replace(",", ".").replace("%", "").strip())
         except Exception:
@@ -6308,37 +6427,12 @@ async def admin_text_handler(update, context):
             await update.message.reply_text("❌ Foiz 0 dan 1000 gacha bo'lishi kerak.")
             return True
         kind = state.replace("markup_", "")
-        keys = {"donat":"donat_markup_percent", "roblox":"roblox_markup_percent", "sim":"sim_markup_percent", "stars":"stars_markup_percent", "premium":"premium_markup_percent"}
-        labels = {"donat":"🎮 Donat", "roblox":"🎮 Roblox", "sim":"📱 SIM / Virtual raqam", "stars":"⭐ Stars", "premium":"💎 Premium"}
+        keys = {"donat":"donat_markup_percent", "sim":"sim_markup_percent", "stars":"stars_markup_percent", "premium":"premium_markup_percent"}
+        labels = {"donat":"🎮 Donat", "sim":"📱 SIM / Virtual raqam", "stars":"⭐ Stars", "premium":"💎 Premium"}
         set_setting(keys[kind], str(percent))
-
-        # Saqlangan foizni mavjud Roblox paketlariga ham darhol qo'llaymiz.
-        updated_packages = 0
-        if kind == "roblox":
-            price_conn = conn()
-            try:
-                roblox_rows = price_conn.execute(
-                    "SELECT p.game_id,p.paket_id,p.api_price_uzs "
-                    "FROM products p JOIN games g ON g.game_id=p.game_id "
-                    "WHERE p.active=1 AND LOWER(g.name) LIKE '%roblox%'"
-                ).fetchall()
-                for product_row in roblox_rows:
-                    new_price = calc_sale_price(product_row["api_price_uzs"] or 0)
-                    price_conn.execute(
-                        "UPDATE products SET sale_price=?,updated_at=? WHERE game_id=? AND paket_id=?",
-                        (float(new_price), datetime.now().isoformat(), int(product_row["game_id"]), int(product_row["paket_id"]))
-                    )
-                    updated_packages += 1
-                price_conn.commit()
-            finally:
-                price_conn.close()
-            # Asosiy katalogdagi yangi narxlar ulangan botlarga ham ko'chiriladi.
-            sync_all_child_catalogs()
-
         context.user_data.clear()
-        extra = f"\n📦 Yangilangan Roblox paketlari: {updated_packages} ta" if kind == "roblox" else ""
         await update.message.reply_text(
-            f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%{extra}\n\n"
+            f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%\n\n"
             "Bu xizmatning ustamasi boshqalardan alohida.",
             reply_markup=admin_kb(context)
         )
@@ -7249,12 +7343,6 @@ async def admin_callback(update, context):
     elif d == "adm_markup_donat":
         await admin_markup_start(update, context, "donat")
 
-    elif d == "adm_markup_roblox":
-        if not (q.from_user.id == bot_admin_id(context) and not is_child_bot(context)):
-            await q.answer("Bu sozlama faqat asosiy bot admini uchun.", show_alert=True)
-            return
-        await admin_markup_start(update, context, "roblox")
-
     elif d == "adm_markup_sim":
         await admin_markup_start(update, context, "sim")
 
@@ -7706,14 +7794,9 @@ def main():
     init_db()
     ensure_external_schema()
 
-    # Faqat Roblox katalogi ishlatiladi; boshqa o'yinlar deaktiv qilinadi.
-    c = conn()
-    try:
-        c.execute("UPDATE games SET active=0 WHERE LOWER(name) NOT LIKE '%roblox%'")
-        c.execute("UPDATE products SET active=0 WHERE game_id IN (SELECT game_id FROM games WHERE LOWER(name) NOT LIKE '%roblox%')")
-        c.commit()
-    finally:
-        c.close()
+    ensure_pubg()
+    ensure_mobile_legends()
+    ensure_mobile_legends_global_catalog()
 
     # Eski PlayPay katalogi Bay2Game product_code bo'lmagan holda sotuvga chiqmasin.
     # Bay2Game katalogi admin panelidagi "Katalog" tugmasi orqali yangilanadi.
