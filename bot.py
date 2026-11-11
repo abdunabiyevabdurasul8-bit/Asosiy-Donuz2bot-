@@ -114,7 +114,7 @@ class PGConnection:
             # Tables with generated integer ids only; other inserts need no lastrowid.
             if table.lower() in {'payments','orders','withdrawals','balance_history','omonats','external_orders','web_auth_codes','web_orders'}:
                 query += " RETURNING id"
-        cur.execute(query, params or ())
+        cur.execute(query, params if params else None)
         last_id=None
         if " RETURNING id" in query.upper():
             row=cur.fetchone()
