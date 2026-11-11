@@ -207,6 +207,8 @@ except (ValueError, TypeError):
     ADMIN_ID = 0
 
 BAY2GAME_API_KEY = os.getenv("BAY2GAME_API_KEY", "").strip()
+YUPAY_API_KEY = os.getenv("YUPAY_API_KEY", "").strip()
+YUPAY_BASE = os.getenv("YUPAY_BASE", "https://api.yupay.uz").rstrip("/")
 PLAYPAY_API_KEY = os.getenv("PLAYPAY_API_KEY", "").strip()
 PLAYPAY_BASE = os.getenv("PLAYPAY_BASE", "https://playpay.uz/api/v1").rstrip("/")
 ORDER_CHANNEL_ID = os.getenv("ORDER_CHANNEL_ID", "@Donuz_Buyurtmlar").strip() or "@Donuz_Buyurtmlar"
@@ -223,6 +225,7 @@ PUBG_GLOBAL_GAME_ID = 142  # PUBG Mobile Global, alohida API katalogi bo'lsa
 MOBILE_LEGENDS_GAME_ID = 54
 MOBILE_LEGENDS_GLOBAL_GAME_ID = 143
 GRAND_MOBILE_GAME_ID = 999001
+ROBLOX_GAME_ID = 999002
 
 # Grand Mobile — faqat manual buyurtma, narxlar o'zgartirilmaydi
 GRAND_MOBILE_PRICES = {
@@ -520,6 +523,8 @@ def web_check_id(payload):
             "player_id": player_id,
             "message": "Grand Mobile buyurtmasi manual tekshiriladi."
         }
+    if game_id == ROBLOX_GAME_ID:
+        return {"ok": True, "validation_supported": False, "player_id": player_id}
 
     status, data = playpay_check_id(
         game_id, player_id,
@@ -977,6 +982,7 @@ def init_db():
     set_default("premium_markup_percent", TELEGRAM_MARKUP_PERCENT)
     set_default("sim_markup_percent", SIM_MARKUP_PERCENT)
     set_default("referral_bonus_uzs", "100")
+    set_default("roblox_markup_percent", "0")
 
     if active_db() == MAIN_DB:
         c = conn()
@@ -2165,6 +2171,219 @@ def referral_stats(uid):
 
 
 # ============================================================
+# YUPAY API — FAQAT ROBLOX
+# ============================================================
+
+def yupay_request(method, path, payload=None):
+    """YuPay Merchant API: Bearer API key bilan JSON so'rov."""
+    if not YUPAY_API_KEY:
+        return 0, {"ok": False, "error": "YUPAY_API_KEY sozlanmagan."}
+    headers = {
+        "Authorization": f"Bearer {YUPAY_API_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    try:
+        response = requests.request(
+            method.upper(),
+            f"{YUPAY_BASE}/{path.lstrip('/')}",
+            headers=headers,
+            json=payload if payload is not None else None,
+            timeout=35,
+        )
+        try:
+            data = response.json()
+        except Exception:
+            data = {"message": response.text[:500]}
+        if not isinstance(data, dict):
+            data = {"data": data}
+        data["http_status"] = response.status_code
+        data["ok"] = bool(response.ok and data.get("ok") is not False and
+                           data.get("success") is not False and
+                           str(data.get("status", "")).lower() not in ("error", "failed", "rejected"))
+        if not data["ok"]:
+            data.setdefault("error", data.get("message") or f"HTTP {response.status_code}")
+        return response.status_code, data
+    except requests.RequestException as exc:
+        log.warning("YuPay aloqa xatosi: %s", type(exc).__name__)
+        return 0, {"ok": False, "error": "YuPay bilan aloqa xatosi."}
+    except Exception as exc:
+        log.exception("YuPay so'rov xatosi")
+        return 0, {"ok": False, "error": str(exc)[:400]}
+
+
+def get_roblox_markup_percent():
+    """Roblox ustamasi barcha botlar uchun asosiy DB'dan olinadi."""
+    try:
+        c = main_conn()
+        row = c.execute("SELECT value FROM settings WHERE key='roblox_markup_percent'").fetchone()
+        c.close()
+        value = Decimal(str(row["value"] if row else "0"))
+        return max(Decimal("0"), min(Decimal("1000"), value))
+    except Exception:
+        log.exception("Roblox ustamasini o'qishda xato")
+        return Decimal("0")
+
+
+def calc_roblox_sale_price(api_price_uzs):
+    base = Decimal(str(api_price_uzs or 0))
+    markup = get_roblox_markup_percent()
+    return (base * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
+
+
+def _yupay_catalog_brands(data):
+    root = data.get("data") if isinstance(data.get("data"), dict) else data
+    brands = root.get("brands", []) if isinstance(root, dict) else []
+    return [x for x in brands if isinstance(x, dict)] if isinstance(brands, list) else []
+
+
+def sync_roblox_catalog():
+    """YuPay katalogidan faqat Roblox mahsulotlarini saqlaydi; boshqa o'yinlarga tegmaydi."""
+    if not YUPAY_API_KEY:
+        return False, "YUPAY_API_KEY Render Environment'ga kiritilmagan."
+    status, data = yupay_request("GET", "/merchant/v1/catalog")
+    if not data.get("ok"):
+        return False, f"Roblox katalogini olishda xato (HTTP {status})."
+    brands = _yupay_catalog_brands(data)
+    roblox_products = []
+    for brand in brands:
+        brand_name = str(brand.get("name") or brand.get("title") or brand.get("slug") or "").strip()
+        products = brand.get("products") or []
+        if not isinstance(products, list):
+            continue
+        brand_is_roblox = "roblox" in brand_name.lower()
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            product_name = str(product.get("name") or product.get("title") or product.get("slug") or "").strip()
+            if brand_is_roblox or "roblox" in product_name.lower():
+                roblox_products.append((brand_name or "Roblox", product))
+    if not roblox_products:
+        return False, "YuPay katalogida Roblox mahsuloti topilmadi."
+
+    saved = 0
+    fields_for_game = []
+    now = datetime.now().isoformat()
+    c = conn()
+    try:
+        old_roblox = c.execute(
+            "SELECT game_id FROM games WHERE lower(name) LIKE '%roblox%' AND game_id<>?",
+            (ROBLOX_GAME_ID,),
+        ).fetchall()
+        for old_row in old_roblox:
+            c.execute("UPDATE games SET active=0 WHERE game_id=?", (old_row["game_id"],))
+            c.execute("UPDATE products SET active=0 WHERE game_id=?", (old_row["game_id"],))
+        c.execute(
+            "INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (ROBLOX_GAME_ID, "Roblox", "Roblox User ID", 0, 0, 1, now, "yupay:roblox", "[]"),
+        )
+        for brand_name, product in roblox_products:
+            product_name = str(product.get("name") or product.get("title") or "Roblox").strip()
+            fields = product.get("required_fields") or []
+            if isinstance(fields, list) and fields and not fields_for_game:
+                fields_for_game = fields
+            skus = product.get("skus") or []
+            if not isinstance(skus, list):
+                continue
+            for sku in skus:
+                if not isinstance(sku, dict):
+                    continue
+                sku_id = str(sku.get("sku_id") or sku.get("id") or "").strip()
+                if not sku_id:
+                    continue
+                kind = str(sku.get("kind") or "fixed").lower()
+                # Roblox katalogidagi fixed paketlar aniq narx bilan sotiladi.
+                if kind != "fixed":
+                    log.info("YuPay Roblox SKU o'tkazib yuborildi: kind=%s sku=%s", kind, sku_id)
+                    continue
+                try:
+                    usd = Decimal(str(sku.get("price_usd") or 0))
+                except Exception:
+                    usd = Decimal("0")
+                if usd <= 0:
+                    continue
+                api_uzs = usd * get_bay2game_usd_uzs()
+                sale_price = calc_roblox_sale_price(api_uzs)
+                sku_title = str(sku.get("name") or sku.get("title") or sku.get("sku_code") or sku_id)
+                package_name = f"{product_name} — {sku_title}"
+                paket_id = bay2game_internal_id(sku_id)
+                stock = sku.get("stock")
+                active = 0 if sku.get("is_available") is False or str(stock).lower() in ("0", "false", "out_of_stock") else 1
+                c.execute(
+                    "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (ROBLOX_GAME_ID, paket_id, "Roblox", package_name, float(usd), float(api_uzs),
+                     float(sale_price), active, now, sku_id),
+                )
+                saved += 1
+        c.execute(
+            "UPDATE games SET game_fields_json=? WHERE game_id=?",
+            (json.dumps(fields_for_game, ensure_ascii=False), ROBLOX_GAME_ID),
+        )
+        c.commit()
+    except Exception:
+        c.rollback()
+        log.exception("YuPay Roblox katalogini DB'ga yozishda xato")
+        return False, "Roblox katalogini saqlashda ichki xato."
+    finally:
+        c.close()
+    if saved == 0:
+        return False, "Roblox katalogi olindi, lekin sotiladigan fixed paket topilmadi."
+    return True, f"Roblox katalogi yangilandi: {saved} ta paket."
+
+
+def yupay_create_roblox_order(game_id, paket_id, player_id):
+    """Roblox uchun YuPay Merchant order; boshqa o'yinlar bu funksiyaga kirmaydi."""
+    c = conn()
+    try:
+        product = c.execute(
+            "SELECT provider_product_code,price_usd,package_name FROM products "
+            "WHERE game_id=? AND paket_id=? AND active=1",
+            (int(game_id), int(paket_id)),
+        ).fetchone()
+        game = c.execute("SELECT game_fields_json FROM games WHERE game_id=?", (ROBLOX_GAME_ID,)).fetchone()
+    finally:
+        c.close()
+    if not product or not product["provider_product_code"]:
+        return 400, {"ok": False, "error": "Roblox SKU topilmadi."}
+    try:
+        fields = json.loads(game["game_fields_json"] or "[]") if game else []
+    except Exception:
+        fields = []
+    required = [f for f in fields if isinstance(f, dict) and f.get("required", True)]
+    fulfillment_data = {}
+    if required:
+        # Roblox hisob identifikatori katalogdagi birinchi majburiy maydonga yoziladi.
+        field = required[0]
+        key = str(field.get("key") or "player_id")
+        fulfillment_data[key] = str(player_id).strip()
+    else:
+        fulfillment_data["player_id"] = str(player_id).strip()
+    merchant_order_id = f"DONUZ-{uuid.uuid4().hex[:24].upper()}"
+    payload = {
+        "expected_price": format(Decimal(str(product["price_usd"])), "f"),
+        "fulfillment_data": fulfillment_data,
+        "merchant_order_id": merchant_order_id,
+        "sku_id": str(product["provider_product_code"]),
+    }
+    status, raw = yupay_request("POST", "/merchant/v1/orders", payload)
+    nested = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+    order = nested.get("order") if isinstance(nested.get("order"), dict) else nested
+    if not raw.get("ok") or status < 200 or status >= 300:
+        return status, {"ok": False, "error": str(raw.get("error") or raw.get("message") or "Buyurtma qabul qilinmadi.")[:400], "raw": raw}
+    order_id = str(order.get("order_id") or order.get("id") or order.get("merchant_order_id") or merchant_order_id)
+    order_status = str(order.get("status") or nested.get("status") or "processing").lower()
+    if order_status in ("failed", "failure", "error", "rejected", "cancelled"):
+        return status, {"ok": False, "error": str(order.get("message") or order_status), "raw": raw}
+    return status, {
+        "ok": True, "order_id": order_id, "reference": merchant_order_id,
+        "status": order_status, "price": {"amount": product["price_usd"]},
+        "charged": {"amount": order.get("price_usd", product["price_usd"])}, "raw": raw,
+    }
+
+
+# ============================================================
 # BAY2GAME API
 # ============================================================
 
@@ -2528,6 +2747,8 @@ def api_post(path, body):
         paket_id = int(body.get("paket_id"))
         player_id = str(body.get("player_id") or "").strip()
         server_id = str(body.get("server_id") or "").strip()
+        if game_id == ROBLOX_GAME_ID:
+            return yupay_create_roblox_order(game_id, paket_id, player_id)
         c = conn()
         product = c.execute(
             "SELECT provider_product_code,price_usd FROM products WHERE game_id=? AND paket_id=? AND active=1",
@@ -2915,6 +3136,8 @@ def sync_catalog():
             category.get("name") or category.get("game_name") or category.get("gameName") or
             category.get("category_name") or category.get("title") or category.get("slug") or game_code
         ).strip()
+        if "roblox" in (name + " " + game_code).lower():
+            continue
         # API qaytargan o'yinlarni to'liq ko'rsatamiz; nomi PUBG Delay bo'lsa ham yashirmaymiz.
         # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
         region = str(category.get("region") or category.get("server") or category.get("version") or "").strip()
@@ -3378,6 +3601,7 @@ def admin_kb(context=None):
         ],
     ]
     if show_platform_controls:
+        rows.append([InlineKeyboardButton("🟩 Roblox ustama", callback_data="adm_markup_roblox")])
         rows.append([InlineKeyboardButton("🔄 Katalog", callback_data="a_sync")])
     return InlineKeyboardMarkup(rows)
 
@@ -3890,7 +4114,7 @@ async def game(update, context):
 
     # Paketlar lokal DB'da bo'lmasa, aynan tanlangan o'yin paketlarini
     # Bay2Game katalogidan yangilaymiz.
-    if g and not rows:
+    if g and not rows and game_id != ROBLOX_GAME_ID:
         try:
             data = await asyncio.to_thread(get_packages_api, game_id)
             if data:
@@ -3929,7 +4153,10 @@ async def game(update, context):
     id_label = g["id_label"] or "Player ID"
     requires_server = bool(g["requires_server"])
 
-    if game_id in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID):
+    if game_id == ROBLOX_GAME_ID:
+        id_label = "Roblox User ID"
+        requires_server = False
+    elif game_id in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID):
         id_label = "Player ID"
         requires_server = False
     elif game_id in (MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID):
@@ -3950,7 +4177,7 @@ async def game(update, context):
     for r in rows:
         try:
             sale = Decimal(str(r["sale_price"]))
-            price = child_price(sale, markup)
+            price = sale if game_id == ROBLOX_GAME_ID else child_price(sale, markup)
             paket_id = int(r["paket_id"])
             package_name = str(r["package_name"] or "Paket")
         except Exception:
@@ -4085,7 +4312,8 @@ async def offer(update, context):
             "game_name"
         ],
 
-        "price": child_price(r["sale_price"], get_child_markup(context)),
+        "price": (Decimal(str(r["sale_price"])) if game_id == ROBLOX_GAME_ID
+                  else child_price(r["sale_price"], get_child_markup(context))),
 
         "id_label": id_label,
 
@@ -4098,7 +4326,7 @@ async def offer(update, context):
         f"🎮 {r['game_name']}\n"
         f"📦 {r['package_name']}\n"
         f"💰 Narx: "
-        f"{child_price(r['sale_price'], get_child_markup(context)):,.0f} so'm\n\n"
+        f"{(Decimal(str(r['sale_price'])) if game_id == ROBLOX_GAME_ID else child_price(r['sale_price'], get_child_markup(context))):,.0f} so'm\n\n"
         f"🆔 {id_label} ni yuboring:\n\n"
         "Bekor qilish uchun /cancel"
     )
@@ -5044,7 +5272,13 @@ async def text_handler(update, context):
             context.user_data.get("server_id", "")
         ).strip()
 
-        # Mobile Legends Russia va Global uchun nickname/ID lookup qilinmaydi.
+        # Roblox va Mobile Legends uchun tashqi nickname/ID lookup talab qilinmaydi.
+        if game_id == ROBLOX_GAME_ID:
+            context.user_data.pop("player_name", None)
+            context.user_data["state"] = None
+            await update.message.reply_text("✅ Roblox User ID qabul qilindi. Nickname tekshiruvi talab qilinmaydi.")
+            await confirm_order(update.message, context)
+            return
         if game_id in (MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID):
             context.user_data.pop("player_name", None)
             context.user_data["state"] = None
@@ -6222,6 +6456,7 @@ async def admin_markup_start(update, context, kind):
         "sim": ("📱 SIM", "sim_markup_percent", SIM_MARKUP_PERCENT),
         "stars": ("⭐ Stars", "stars_markup_percent", TELEGRAM_MARKUP_PERCENT),
         "premium": ("💎 Premium", "premium_markup_percent", TELEGRAM_MARKUP_PERCENT),
+        "roblox": ("🟩 Roblox", "roblox_markup_percent", Decimal("0")),
     }
     label, key, default = labels[kind]
     try:
@@ -6417,7 +6652,7 @@ async def admin_text_handler(update, context):
     # ========================================================
     # ALOHIDA USTAMALAR
     # ========================================================
-    if state in ("markup_donat", "markup_sim", "markup_stars", "markup_premium"):
+    if state in ("markup_donat", "markup_sim", "markup_stars", "markup_premium", "markup_roblox"):
         try:
             percent = Decimal(text.replace(",", ".").replace("%", "").strip())
         except Exception:
@@ -6427,13 +6662,35 @@ async def admin_text_handler(update, context):
             await update.message.reply_text("❌ Foiz 0 dan 1000 gacha bo'lishi kerak.")
             return True
         kind = state.replace("markup_", "")
-        keys = {"donat":"donat_markup_percent", "sim":"sim_markup_percent", "stars":"stars_markup_percent", "premium":"premium_markup_percent"}
-        labels = {"donat":"🎮 Donat", "sim":"📱 SIM / Virtual raqam", "stars":"⭐ Stars", "premium":"💎 Premium"}
-        set_setting(keys[kind], str(percent))
+        keys = {"donat":"donat_markup_percent", "sim":"sim_markup_percent", "stars":"stars_markup_percent", "premium":"premium_markup_percent", "roblox":"roblox_markup_percent"}
+        labels = {"donat":"🎮 Donat", "sim":"📱 SIM / Virtual raqam", "stars":"⭐ Stars", "premium":"💎 Premium", "roblox":"🟩 Roblox"}
+        if kind == "roblox":
+            # Roblox narxlarini asosiy DB va barcha ulangan botlarda bir xil yangilaymiz.
+            set_setting(keys[kind], str(percent))
+            c = conn()
+            rows = c.execute(
+                "SELECT paket_id,api_price_uzs FROM products WHERE game_id=?",
+                (ROBLOX_GAME_ID,),
+            ).fetchall()
+            changed = []
+            for row in rows:
+                new_price = (Decimal(str(row["api_price_uzs"] or 0)) *
+                             (Decimal("1") + percent / Decimal("100"))).quantize(Decimal("1"))
+                c.execute(
+                    "UPDATE products SET sale_price=?,updated_at=? WHERE game_id=? AND paket_id=?",
+                    (float(new_price), datetime.now().isoformat(), ROBLOX_GAME_ID, row["paket_id"]),
+                )
+                changed.append((ROBLOX_GAME_ID, row["paket_id"], new_price))
+            c.commit()
+            c.close()
+            for gid, pid, new_price in changed:
+                propagate_product_price(gid, pid, new_price)
+        else:
+            set_setting(keys[kind], str(percent))
         context.user_data.clear()
         await update.message.reply_text(
-            f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%\n\n"
-            "Bu xizmatning ustamasi boshqalardan alohida.",
+            f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%"
+            + (f"\n📦 {len(changed)} ta Roblox paketi va barcha ulangan botlar yangilandi." if kind == "roblox" else "\n\nBu xizmatning ustamasi boshqalardan alohida."),
             reply_markup=admin_kb(context)
         )
         return True
@@ -7379,6 +7636,9 @@ async def admin_callback(update, context):
     elif d == "adm_markup_premium":
         await admin_markup_start(update, context, "premium")
 
+    elif d == "adm_markup_roblox":
+        await admin_markup_start(update, context, "roblox")
+
     elif d == "adm_promo":
 
         await admin_promo_start(
@@ -7411,14 +7671,14 @@ async def admin_callback(update, context):
             "🔄 Katalog yangilanmoqda..."
         )
 
-        ok, result = await asyncio.to_thread(
-            sync_catalog
-        )
-        if ok:
+        ok, result = await asyncio.to_thread(sync_catalog)
+        roblox_ok, roblox_result = await asyncio.to_thread(sync_roblox_catalog)
+        if ok or roblox_ok:
             sync_all_child_catalogs()
 
         await q.message.reply_text(
-            f"{'✅' if ok else '❌'} {result}",
+            f"{'✅' if ok else '⚠️'} {result}\n"
+            f"{'✅' if roblox_ok else '⚠️'} {roblox_result}",
             reply_markup=admin_kb(context)
         )
 
