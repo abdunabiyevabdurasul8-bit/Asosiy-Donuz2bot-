@@ -1425,6 +1425,52 @@ def sync_all_child_catalogs():
         except Exception: log.exception("Child katalog sync xatosi")
 
 
+def sync_roblox_to_child_bots():
+    """Faqat Roblox yozuvlarini ulangan botlar bazasiga tarqatadi; qolgan katalogga tegmaydi."""
+    src = main_conn()
+    try:
+        game = src.execute("SELECT * FROM games WHERE game_id=?", (ROBLOX_GAME_ID,)).fetchone()
+        products = src.execute("SELECT * FROM products WHERE game_id=?", (ROBLOX_GAME_ID,)).fetchall()
+        children = src.execute("SELECT db_path FROM child_bots WHERE status='active'").fetchall()
+        game_cols = [r[1] for r in src.execute("PRAGMA table_info(games)").fetchall()]
+        product_cols = [r[1] for r in src.execute("PRAGMA table_info(products)").fetchall()]
+    finally:
+        src.close()
+    if not game:
+        return 0
+    copied = 0
+    for child in children:
+        db_path = child["db_path"]
+        try:
+            cc = sqlite3.connect(db_path, timeout=30)
+            cc.row_factory = sqlite3.Row
+            cc.execute("PRAGMA journal_mode=WAL")
+            child_game_cols = {r[1] for r in cc.execute("PRAGMA table_info(games)").fetchall()}
+            child_product_cols = {r[1] for r in cc.execute("PRAGMA table_info(products)").fetchall()}
+            gcols = [x for x in game_cols if x in child_game_cols]
+            pcols = [x for x in product_cols if x in child_product_cols]
+            cc.execute("BEGIN")
+            cc.execute(f"INSERT OR REPLACE INTO games({','.join(gcols)}) VALUES({','.join('?' for _ in gcols)})",
+                       tuple(game[x] for x in gcols))
+            # Faqat Roblox paketlari almashtiriladi; boshqa o'yinlar saqlanadi.
+            cc.execute("DELETE FROM products WHERE game_id=?", (ROBLOX_GAME_ID,))
+            for product in products:
+                cc.execute(f"INSERT OR REPLACE INTO products({','.join(pcols)}) VALUES({','.join('?' for _ in pcols)})",
+                           tuple(product[x] for x in pcols))
+            cc.execute("UPDATE products SET active=0 WHERE game_id=? AND (lower(package_name) LIKE '%b2g gift cards%' OR lower(package_name) LIKE '%gift card%')",
+                       (ROBLOX_GAME_ID,))
+            cc.commit()
+            cc.close()
+            copied += 1
+        except Exception:
+            try:
+                cc.rollback(); cc.close()
+            except Exception:
+                pass
+            log.exception("Ulangan botga faqat Roblox katalogini tarqatishda xato: %s", db_path)
+    return copied
+
+
 async def start_child_bot(bot_id):
     if bot_id in CHILD_APPS:
         return
@@ -2344,8 +2390,11 @@ def sync_roblox_catalog():
         # Faqat B2G Gift Cards nomli eski yozuvlarni o'chirib qo'yamiz;
         # boshqa o'yinlar va ularning narxlari o'zgarishsiz qoladi.
         c.execute(
-            "UPDATE products SET active=0 WHERE lower(COALESCE(game_name,'')) LIKE '%b2g gift cards%' "
-            "OR lower(COALESCE(package_name,'')) LIKE '%b2g gift cards%'"
+            "UPDATE products SET active=0 WHERE game_id=? AND ("
+            "lower(COALESCE(game_name,'')) LIKE '%b2g gift cards%' "
+            "OR lower(COALESCE(package_name,'')) LIKE '%b2g gift cards%' "
+            "OR lower(COALESCE(package_name,'')) LIKE '%gift card%')",
+            (ROBLOX_GAME_ID,),
         )
         c.execute("UPDATE games SET game_fields_json=? WHERE game_id=?",
                   (json.dumps(fields_for_game, ensure_ascii=False), ROBLOX_GAME_ID))
@@ -3630,7 +3679,8 @@ def admin_kb(context=None):
     ]
     if show_platform_controls:
         rows.append([InlineKeyboardButton("🟩 Roblox ustama", callback_data="adm_markup_roblox")])
-        rows.append([InlineKeyboardButton("🔄 Katalog", callback_data="a_sync")])
+        rows.append([InlineKeyboardButton("🎮 Roblox katalogini yangilash", callback_data="adm_sync_roblox")])
+        rows.append([InlineKeyboardButton("🔄 Umumiy katalog", callback_data="a_sync")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -7496,7 +7546,7 @@ async def admin_callback(update, context):
 
     d = q.data
 
-    platform_only_callbacks = {"adm_bay2game_rate", "adm_playpay_balance", "a_sync"}
+    platform_only_callbacks = {"adm_bay2game_rate", "adm_playpay_balance", "a_sync", "adm_sync_roblox"}
     if d in platform_only_callbacks and (is_child_bot(context) or q.from_user.id != ADMIN_ID):
         await q.answer("Xatolik", show_alert=True)
         return
@@ -7688,6 +7738,22 @@ async def admin_callback(update, context):
             context
         )
 
+
+    # ========================================================
+    # FAQAT ROBLOX KATALOGI: asosiy bot + barcha ulangan botlar
+    # ========================================================
+
+    elif d == "adm_sync_roblox":
+        await q.message.reply_text("🎮 Faqat Roblox katalogi YuPay'dan yangilanmoqda. Boshqa o'yinlarga tegilmaydi...")
+        ok, result = await asyncio.to_thread(sync_roblox_catalog)
+        copied = 0
+        if ok:
+            copied = await asyncio.to_thread(sync_roblox_to_child_bots)
+        await q.message.reply_text(
+            (f"✅ {result}\n\n🔗 Ulangan botlarga ham tarqatildi: {copied} ta bot.\n"
+             "Boshqa o'yinlar va paketlar o'zgartirilmadi." if ok else f"⚠️ {result}"),
+            reply_markup=admin_kb(context)
+        )
 
     # ========================================================
     # FAQAT ADMIN KATALOG YANGILAYDI
