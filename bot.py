@@ -3145,8 +3145,31 @@ def telegram_stars_amount(product_code="", package_name=""):
 
 
 def sync_catalog():
-    """Bay2Game categories va products katalogini yangilaydi."""
+    """Bay2Game katalogini yangilaydi; B2B/B2G Gift Cards xizmatlari butunlay chiqarib tashlanadi."""
     categories = get_games_api() or []
+
+    # Avval bazada avvaldan qolgan B2B/B2G Gift Cards o'yinlarini yashiramiz.
+    # Keyingi sync_all_child_catalogs() bu holatni ulangan botlarga ham tarqatadi.
+    try:
+        cleanup = conn()
+        cleanup.execute(
+            "UPDATE games SET active=0 WHERE "
+            "lower(COALESCE(name,'')) LIKE '%%b2b%%' "
+            "OR lower(COALESCE(name,'')) LIKE '%%b2g gift cards%%' "
+            "OR lower(COALESCE(provider_game_code,'')) LIKE '%%b2b%%' "
+            "OR lower(COALESCE(provider_game_code,'')) LIKE '%%b2g%%'"
+        )
+        cleanup.execute(
+            "UPDATE products SET active=0 WHERE "
+            "lower(COALESCE(game_name,'')) LIKE '%%b2b%%' "
+            "OR lower(COALESCE(game_name,'')) LIKE '%%b2g gift cards%%' "
+            "OR lower(COALESCE(package_name,'')) LIKE '%%b2b%%' "
+            "OR lower(COALESCE(package_name,'')) LIKE '%%b2g gift cards%%'"
+        )
+        cleanup.commit()
+        cleanup.close()
+    except Exception:
+        log.exception("Eski B2B/B2G Gift Cards yozuvlarini o'chirishda xato")
 
     game_count = 0
     product_count = 0
@@ -3213,7 +3236,12 @@ def sync_catalog():
             category.get("name") or category.get("game_name") or category.get("gameName") or
             category.get("category_name") or category.get("title") or category.get("slug") or game_code
         ).strip()
-        if "roblox" in (name + " " + game_code).lower():
+        catalog_identity = (name + " " + game_code).lower()
+        # Roblox faqat YuPay'dan keladi. B2B/B2G Gift Cards Bay2Game'dan olinmaydi.
+        if "roblox" in catalog_identity:
+            continue
+        if "b2b" in catalog_identity or "b2g" in catalog_identity:
+            log.info("Bay2Game B2B/Gift Cards katalog elementi o'tkazib yuborildi: %s", name or game_code)
             continue
         # API qaytargan o'yinlarni to'liq ko'rsatamiz; nomi PUBG Delay bo'lsa ham yashirmaymiz.
         # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
@@ -3255,7 +3283,9 @@ def sync_catalog():
                 usd = Decimal(str(product.get("sell_price", product.get("price", {}).get("usd", 0)) or 0))
                 api_uzs = usd * get_bay2game_usd_uzs()
                 package_name = str(product.get("name") or product.get("product_name") or product_code)
-                service_words = (str(name) + " " + package_name).lower()
+                service_words = (str(name) + " " + package_name + " " + product_code).lower()
+                if "b2b" in service_words or "b2g" in service_words:
+                    continue
                 if "premium" in service_words:
                     try:
                         markup = Decimal(str(get_setting("premium_markup_percent", TELEGRAM_MARKUP_PERCENT)))
@@ -4075,6 +4105,19 @@ async def games(update, context):
 
     c = conn()
 
+    # Roblox o'yinlar ro'yxatida doim ko'rinsin; paketlar YuPay'dan
+    # alohida admin yangilash orqali keladi. Mavjud o'yinlarga tegmaydi.
+    try:
+        c.execute(
+            "INSERT INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id) DO NOTHING",
+            (ROBLOX_GAME_ID, "Roblox", "Roblox User ID", 0, 0, 1,
+             datetime.now().isoformat(), "yupay:roblox", "[]"),
+        )
+        c.commit()
+    except Exception:
+        log.exception("Roblox o'yinini ro'yxatga qo'shishda xato")
+
     rows = c.execute(
         """
         SELECT *
@@ -4086,7 +4129,8 @@ async def games(update, context):
                 WHEN game_id=? THEN 1
                 WHEN game_id=? THEN 2
                 WHEN game_id=? THEN 3
-                ELSE 4
+                WHEN game_id=? THEN 4
+                ELSE 5
             END,
             name
         """,
@@ -4094,7 +4138,8 @@ async def games(update, context):
             PUBG_GAME_ID,
             PUBG_GLOBAL_GAME_ID,
             MOBILE_LEGENDS_GAME_ID,
-            MOBILE_LEGENDS_GLOBAL_GAME_ID
+            MOBILE_LEGENDS_GLOBAL_GAME_ID,
+            ROBLOX_GAME_ID,
         )
     ).fetchall()
 
@@ -4121,11 +4166,12 @@ async def games(update, context):
                         WHEN game_id=? THEN 1
                         WHEN game_id=? THEN 2
                         WHEN game_id=? THEN 3
-                        ELSE 4
+                        WHEN game_id=? THEN 4
+                        ELSE 5
                     END,
                     name
                 """,
-                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID)
+                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID, ROBLOX_GAME_ID)
             ).fetchall()
             c.close()
 
