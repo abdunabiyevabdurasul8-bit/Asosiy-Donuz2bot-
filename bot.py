@@ -2238,12 +2238,13 @@ def _yupay_catalog_brands(data):
 
 
 def sync_roblox_catalog():
-    """YuPay katalogidan faqat Roblox mahsulotlarini saqlaydi; boshqa o'yinlarga tegmaydi."""
+    """Faqat Roblox SKUlarini YuPay'dan saqlaydi; gift-card va boshqa o'yinlar chetlanadi."""
     if not YUPAY_API_KEY:
         return False, "YUPAY_API_KEY Render Environment'ga kiritilmagan."
     status, data = yupay_request("GET", "/merchant/v1/catalog")
     if not data.get("ok"):
         return False, f"Roblox katalogini olishda xato (HTTP {status})."
+
     brands = _yupay_catalog_brands(data)
     roblox_products = []
     for brand in brands:
@@ -2251,15 +2252,19 @@ def sync_roblox_catalog():
         products = brand.get("products") or []
         if not isinstance(products, list):
             continue
-        brand_is_roblox = "roblox" in brand_name.lower()
         for product in products:
             if not isinstance(product, dict):
                 continue
             product_name = str(product.get("name") or product.get("title") or product.get("slug") or "").strip()
-            if brand_is_roblox or "roblox" in product_name.lower():
-                roblox_products.append((brand_name or "Roblox", product))
+            searchable = (brand_name + " " + product_name).lower()
+            if "roblox" not in searchable:
+                continue
+            # B2G Gift Cards hech qachon Roblox katalogiga tushmasin.
+            if "gift card" in searchable or "giftcard" in searchable or "b2g" in searchable:
+                continue
+            roblox_products.append((brand_name or "Roblox", product))
     if not roblox_products:
-        return False, "YuPay katalogida Roblox mahsuloti topilmadi."
+        return False, "YuPay katalogida mos Roblox paketi topilmadi."
 
     saved = 0
     fields_for_game = []
@@ -2273,11 +2278,19 @@ def sync_roblox_catalog():
         for old_row in old_roblox:
             c.execute("UPDATE games SET active=0 WHERE game_id=?", (old_row["game_id"],))
             c.execute("UPDATE products SET active=0 WHERE game_id=?", (old_row["game_id"],))
+
+        # Explicit ON CONFLICT kaliti SQLite va PostgreSQL'da bir xil ishlaydi.
         c.execute(
-            "INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id) DO UPDATE SET "
+            "name=excluded.name,id_label=excluded.id_label,requires_server=excluded.requires_server,"
+            "amount_based=excluded.amount_based,active=excluded.active,updated_at=excluded.updated_at,"
+            "provider_game_code=excluded.provider_game_code,game_fields_json=excluded.game_fields_json",
             (ROBLOX_GAME_ID, "Roblox", "Roblox User ID", 0, 0, 1, now, "yupay:roblox", "[]"),
         )
+
+        seen_skus = set()
+        seen_package_ids = set()
         for brand_name, product in roblox_products:
             product_name = str(product.get("name") or product.get("title") or "Roblox").strip()
             fields = product.get("required_fields") or []
@@ -2290,42 +2303,57 @@ def sync_roblox_catalog():
                 if not isinstance(sku, dict):
                     continue
                 sku_id = str(sku.get("sku_id") or sku.get("id") or "").strip()
-                if not sku_id:
+                sku_label = str(sku.get("name") or sku.get("title") or sku.get("sku_code") or "").lower()
+                if "gift card" in sku_label or "giftcard" in sku_label or "b2g" in sku_label:
+                    continue
+                if not sku_id or sku_id in seen_skus:
                     continue
                 kind = str(sku.get("kind") or "fixed").lower()
-                # Roblox katalogidagi fixed paketlar aniq narx bilan sotiladi.
                 if kind != "fixed":
-                    log.info("YuPay Roblox SKU o'tkazib yuborildi: kind=%s sku=%s", kind, sku_id)
                     continue
                 try:
                     usd = Decimal(str(sku.get("price_usd") or 0))
                 except Exception:
-                    usd = Decimal("0")
+                    continue
                 if usd <= 0:
                     continue
                 api_uzs = usd * get_bay2game_usd_uzs()
                 sale_price = calc_roblox_sale_price(api_uzs)
                 sku_title = str(sku.get("name") or sku.get("title") or sku.get("sku_code") or sku_id)
                 package_name = f"{product_name} — {sku_title}"
-                paket_id = bay2game_internal_id(sku_id)
+                paket_id = bay2game_internal_id("yupay:roblox:" + sku_id)
+                # Hash collision bo'lsa, shu SKUni qayta ishlash o'rniga xatoni aniq qayd etamiz.
+                if paket_id in seen_package_ids:
+                    log.error("YuPay Roblox paket ID to'qnashuvi: %s", sku_id)
+                    continue
+                seen_skus.add(sku_id)
+                seen_package_ids.add(paket_id)
                 stock = sku.get("stock")
                 active = 0 if sku.get("is_available") is False or str(stock).lower() in ("0", "false", "out_of_stock") else 1
                 c.execute(
-                    "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id,paket_id) DO UPDATE SET "
+                    "game_name=excluded.game_name,package_name=excluded.package_name,price_usd=excluded.price_usd,"
+                    "api_price_uzs=excluded.api_price_uzs,sale_price=excluded.sale_price,active=excluded.active,"
+                    "updated_at=excluded.updated_at,provider_product_code=excluded.provider_product_code",
                     (ROBLOX_GAME_ID, paket_id, "Roblox", package_name, float(usd), float(api_uzs),
                      float(sale_price), active, now, sku_id),
                 )
                 saved += 1
+
+        # Faqat B2G Gift Cards nomli eski yozuvlarni o'chirib qo'yamiz;
+        # boshqa o'yinlar va ularning narxlari o'zgarishsiz qoladi.
         c.execute(
-            "UPDATE games SET game_fields_json=? WHERE game_id=?",
-            (json.dumps(fields_for_game, ensure_ascii=False), ROBLOX_GAME_ID),
+            "UPDATE products SET active=0 WHERE lower(COALESCE(game_name,'')) LIKE '%b2g gift cards%' "
+            "OR lower(COALESCE(package_name,'')) LIKE '%b2g gift cards%'"
         )
+        c.execute("UPDATE games SET game_fields_json=? WHERE game_id=?",
+                  (json.dumps(fields_for_game, ensure_ascii=False), ROBLOX_GAME_ID))
         c.commit()
-    except Exception:
+    except Exception as exc:
         c.rollback()
-        log.exception("YuPay Roblox katalogini DB'ga yozishda xato")
-        return False, "Roblox katalogini saqlashda ichki xato."
+        log.exception("YuPay Roblox katalogini DB'ga yozishda xato: %s", exc)
+        return False, f"Roblox katalogini saqlashda DB xatosi: {type(exc).__name__}. Tafsilot Render logida."
     finally:
         c.close()
     if saved == 0:
