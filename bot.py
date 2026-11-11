@@ -5044,6 +5044,17 @@ async def text_handler(update, context):
             context.user_data.get("server_id", "")
         ).strip()
 
+        # Mobile Legends Russia va Global uchun nickname/ID lookup qilinmaydi.
+        if game_id in (MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID):
+            context.user_data.pop("player_name", None)
+            context.user_data["state"] = None
+            await update.message.reply_text(
+                "✅ User ID va Server ID qabul qilindi.\n"
+                "ℹ️ Mobile Legends uchun nickname tekshiruvi talab qilinmaydi."
+            )
+            await confirm_order(update.message, context)
+            return
+
         if not PLAYPAY_API_KEY:
             await update.message.reply_text(
                 "❌ ID tekshirish xizmati sozlanmagan. Administrator PLAYPAY_API_KEY ni Render Environment'ga qo'shishi kerak."
