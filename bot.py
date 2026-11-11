@@ -2184,7 +2184,7 @@ def bay2game_internal_id(value):
     if raw.isdigit():
         number = int(raw)
         # Grand Mobile va eski maxsus IDlar bilan to'qnashmasin.
-        if number not in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, GRAND_MOBILE_GAME_ID):
+        if number not in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID, GRAND_MOBILE_GAME_ID):
             return number
     return 100000000 + (int(hashlib.sha256(raw.encode()).hexdigest()[:12], 16) % 800000000)
 
@@ -3783,14 +3783,16 @@ async def games(update, context):
                 WHEN game_id=? THEN 0
                 WHEN game_id=? THEN 1
                 WHEN game_id=? THEN 2
-                ELSE 3
+                WHEN game_id=? THEN 3
+                ELSE 4
             END,
             name
         """,
         (
             PUBG_GAME_ID,
             PUBG_GLOBAL_GAME_ID,
-            MOBILE_LEGENDS_GAME_ID
+            MOBILE_LEGENDS_GAME_ID,
+            MOBILE_LEGENDS_GLOBAL_GAME_ID
         )
     ).fetchall()
 
@@ -3816,11 +3818,12 @@ async def games(update, context):
                         WHEN game_id=? THEN 0
                         WHEN game_id=? THEN 1
                         WHEN game_id=? THEN 2
-                        ELSE 3
+                        WHEN game_id=? THEN 3
+                        ELSE 4
                     END,
                     name
                 """,
-                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID)
+                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID)
             ).fetchall()
             c.close()
 
@@ -3929,7 +3932,7 @@ async def game(update, context):
     if game_id in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID):
         id_label = "Player ID"
         requires_server = False
-    elif game_id == MOBILE_LEGENDS_GAME_ID:
+    elif game_id in (MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID):
         id_label = "User ID"
         requires_server = True
 
@@ -4034,7 +4037,7 @@ async def offer(update, context):
 
     c.close()
 
-    if game_id == MOBILE_LEGENDS_GAME_ID:
+    if game_id in (MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID):
 
         id_label = "User ID"
         requires_server = True
