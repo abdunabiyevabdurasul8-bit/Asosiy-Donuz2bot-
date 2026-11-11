@@ -2318,7 +2318,7 @@ def sync_roblox_catalog():
     c = conn()
     try:
         old_roblox = c.execute(
-            "SELECT game_id FROM games WHERE lower(name) LIKE '%roblox%' AND game_id<>?",
+            "SELECT game_id FROM games WHERE lower(name) LIKE '%%roblox%%' AND game_id<>?",
             (ROBLOX_GAME_ID,),
         ).fetchall()
         for old_row in old_roblox:
@@ -2391,9 +2391,9 @@ def sync_roblox_catalog():
         # boshqa o'yinlar va ularning narxlari o'zgarishsiz qoladi.
         c.execute(
             "UPDATE products SET active=0 WHERE game_id=? AND ("
-            "lower(COALESCE(game_name,'')) LIKE '%b2g gift cards%' "
-            "OR lower(COALESCE(package_name,'')) LIKE '%b2g gift cards%' "
-            "OR lower(COALESCE(package_name,'')) LIKE '%gift card%')",
+            "lower(COALESCE(game_name,'')) LIKE '%%b2g gift cards%%' "
+            "OR lower(COALESCE(package_name,'')) LIKE '%%b2g gift cards%%' "
+            "OR lower(COALESCE(package_name,'')) LIKE '%%gift card%%')",
             (ROBLOX_GAME_ID,),
         )
         c.execute("UPDATE games SET game_fields_json=? WHERE game_id=?",
