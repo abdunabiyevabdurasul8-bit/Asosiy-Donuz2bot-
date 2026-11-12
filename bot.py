@@ -1477,6 +1477,18 @@ async def start_child_bot(bot_id):
     row = child_bot_row(bot_id)
     if not row or not child_active(row):
         return
+
+    # Old child-bot SQLite databases may predate the orders table.
+    # Initialize/upgrade that child's schema before its check_orders job starts.
+    child_db_path = row["db_path"] if row["db_path"] else str(CHILD_DIR / f"{int(bot_id)}.db")
+    previous_db = CURRENT_DB.get()
+    try:
+        CURRENT_DB.set(child_db_path)
+        init_db()
+        ensure_external_schema()
+    finally:
+        CURRENT_DB.set(previous_db)
+
     token = decrypt_token(row["token_enc"])
     app = build_application(token, child=True)
     CHILD_APPS[bot_id] = app
