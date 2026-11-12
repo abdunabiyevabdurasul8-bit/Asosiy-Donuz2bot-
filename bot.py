@@ -4292,13 +4292,11 @@ async def game(update, context):
         ).fetchall()
         c.close()
         available = {str(row["provider_group"]): int(row["n"] or 0) for row in groups}
-        kb = []
-        if available.get("robux"):
-            kb.append([InlineKeyboardButton("💎 Robux", callback_data="rbcat:robux")])
-        if available.get("gift_card"):
-            kb.append([InlineKeyboardButton("🎁 Gift Card", callback_data="rbcat:gift_card")])
-        if not kb:
-            return await q.message.reply_text("❌ Roblox katalogi hali yuklanmagan. Admin Roblox katalogini yangilasin.")
+        # Ikkala bo'lim ham doim ko'rinsin; paket yo'q bo'lsa ichiga kirganda xabar beriladi.
+        kb = [
+            [InlineKeyboardButton("💎 Robux", callback_data="rbcat:robux")],
+            [InlineKeyboardButton("🎁 Gift Card", callback_data="rbcat:gift_card")],
+        ]
         return await _b2tg_edit_or_replace(
             q,
             "🎮 Roblox\n\nBo'limni tanlang:",
