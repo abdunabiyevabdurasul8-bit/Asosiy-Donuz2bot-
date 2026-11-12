@@ -4075,7 +4075,8 @@ async def games(update, context):
                 WHEN game_id=? THEN 1
                 WHEN game_id=? THEN 2
                 WHEN game_id=? THEN 3
-                ELSE 4
+                WHEN game_id=? THEN 4
+                ELSE 5
             END,
             name
         """,
@@ -4083,7 +4084,8 @@ async def games(update, context):
             PUBG_GAME_ID,
             PUBG_GLOBAL_GAME_ID,
             MOBILE_LEGENDS_GAME_ID,
-            MOBILE_LEGENDS_GLOBAL_GAME_ID
+            MOBILE_LEGENDS_GLOBAL_GAME_ID,
+            ROBLOX_GAME_ID,
         )
     ).fetchall()
 
@@ -4110,11 +4112,12 @@ async def games(update, context):
                         WHEN game_id=? THEN 1
                         WHEN game_id=? THEN 2
                         WHEN game_id=? THEN 3
-                        ELSE 4
+                        WHEN game_id=? THEN 4
+                        ELSE 5
                     END,
                     name
                 """,
-                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID)
+                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, MOBILE_LEGENDS_GLOBAL_GAME_ID, ROBLOX_GAME_ID)
             ).fetchall()
             c.close()
 
@@ -4135,11 +4138,11 @@ async def games(update, context):
             )
         ])
 
-    await q.message.reply_text(
+    await _b2tg_edit_or_replace(
+        q,
         "🎮 O'yinni tanlang:",
-        reply_markup=InlineKeyboardMarkup(
-            kb[:100]
-        )
+        reply_markup=InlineKeyboardMarkup(kb[:100]),
+        parse_mode=None,
     )
 
 
@@ -4160,7 +4163,12 @@ async def roblox_category(update, context, group):
     for row in rows:
         price = child_price(row["sale_price"], get_child_markup(context))
         kb.append([InlineKeyboardButton(f"📦 {row['package_name']} — {price:,.0f} so'm", callback_data=f"o:{ROBLOX_GAME_ID}:{int(row['paket_id'])}")])
-    await q.message.reply_text(f"{title}\n\nPaketni tanlang:", reply_markup=InlineKeyboardMarkup(kb[:100]))
+    await _b2tg_edit_or_replace(
+        q,
+        f"{title}\n\nPaketni tanlang:",
+        reply_markup=InlineKeyboardMarkup(kb[:100]),
+        parse_mode=None,
+    )
 
 
 # ============================================================
@@ -4244,7 +4252,12 @@ async def game(update, context):
             kb.append([InlineKeyboardButton("🎁 Gift Card", callback_data="rbcat:gift_card")])
         if not kb:
             return await q.message.reply_text("❌ Roblox katalogi hali yuklanmagan. Admin Roblox katalogini yangilasin.")
-        return await q.message.reply_text("🎮 Roblox\n\nBo'limni tanlang:", reply_markup=InlineKeyboardMarkup(kb))
+        return await _b2tg_edit_or_replace(
+            q,
+            "🎮 Roblox\n\nBo'limni tanlang:",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=None,
+        )
 
     if not rows:
         await q.message.reply_text(
