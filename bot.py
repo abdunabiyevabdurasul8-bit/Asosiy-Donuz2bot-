@@ -213,7 +213,7 @@ PLAYPAY_BASE = os.getenv("PLAYPAY_BASE", "https://playpay.uz/api/v1").rstrip("/"
 ORDER_CHANNEL_ID = os.getenv("ORDER_CHANNEL_ID", "@Donuz_Buyurtmlar").strip() or "@Donuz_Buyurtmlar"
 BAY2GAME_BASE = os.getenv("BAY2GAME_BASE", "https://api.bay2game.xyz/api").rstrip("/")
 # YuPay faqat Roblox katalogi/buyurtmalari uchun ishlatiladi.
-YUPAY_BASE = os.getenv("YUPAY_BASE", "https://api.yupay.uz/merchant/v1").rstrip("/")
+YUPAY_BASE = os.getenv("YUPAY_BASE", "https://api.yupay.uz").rstrip("/")
 YUPAY_API_KEY = os.getenv("YUPAY_API_KEY", "").strip()  # ypk_... Bearer kaliti
 YUPAY_KEY_ID = os.getenv("YUPAY_KEY_ID", "").strip()    # ypm_... HMAC kalit ID
 YUPAY_SECRET = os.getenv("YUPAY_SECRET", "").strip()    # ypms_... HMAC maxfiy kalit
@@ -2625,8 +2625,16 @@ def get_playpay_balance():
 def yupay_request(method, path, body=None):
     """YuPay Merchant API. Bearer kalit yoki hujjatdagi HMAC imzosi bilan ishlaydi."""
     method = str(method or "GET").upper()
-    raw_path = "/merchant/v1" + ("/" + str(path or "").lstrip("/") if path else "")
-    url = YUPAY_BASE + ("/" + str(path or "").lstrip("/") if path else "")
+    # YUPAY_BASE sifatida domenning o'zi yoki /merchant/v1 bilan tugaydigan
+    # manzil berilgan bo'lishi mumkin. Endpointni har doim bitta marta qo'shamiz.
+    endpoint = "/merchant/v1" + ("/" + str(path or "").lstrip("/") if path else "")
+    base = YUPAY_BASE.rstrip("/")
+    if base.endswith("/merchant/v1"):
+        base = base[:-len("/merchant/v1")]
+    elif base.endswith("/merchant/v1/catalog"):
+        base = base[:-len("/merchant/v1/catalog")]
+    raw_path = endpoint
+    url = base + endpoint
     body_bytes = b"" if body is None else json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     headers = {"Accept": "application/json"}
     if body is not None:
