@@ -2696,16 +2696,45 @@ def _yupay_field_keys(fields):
     return {str(x.get("key") or "").strip().lower() for x in fields if isinstance(x, dict)} if isinstance(fields, list) else set()
 
 
-def _yupay_group(brand, product, required_fields):
-    words = " ".join(str(x or "") for x in (
-        brand.get("category_name"), brand.get("category_slug"),
-        product.get("name"), product.get("slug"),
+def _yupay_group(brand, product, required_fields, sku=None):
+    """SKU darajasida ajratadi: Robux nominali ota mahsulot Gift Card deb
+    nomlangan bo'lsa ham Robux bo'limiga tushadi. Aniq Gift Card SKU esa
+    Gift Card bo'lib qoladi.
+    """
+    sku = sku if isinstance(sku, dict) else {}
+    product_words = " ".join(str(x or "") for x in (
+        product.get("name"), product.get("slug"), product.get("product_type"),
+        product.get("type"),
     )).lower()
-    if any(x in words for x in ("gift", "giftcard", "gift-card", "voucher", "card", "подар", "ваучер", "карта")):
-        return "gift_card"
+    sku_words = " ".join(str(x or "") for x in (
+        sku.get("name"), sku.get("sku_code"), sku.get("title"),
+        sku.get("description"), sku.get("kind"),
+    )).lower()
+    brand_words = " ".join(str(x or "") for x in (
+        brand.get("category_name"), brand.get("category_slug"),
+        brand.get("name"), brand.get("slug"),
+    )).lower()
+    gift_terms = ("gift card", "giftcard", "gift-card", "voucher", "подар", "ваучер", "карта")
     keys = _yupay_field_keys(required_fields)
-    if "robux" in words or keys.intersection({"player_id", "user_id", "roblox_id", "username"}):
+
+    # Eng aniq belgi — SKU nomi/kodi ichidagi Robux miqdori.
+    if "robux" in sku_words or "robux" in product_words:
         return "robux"
+
+    # O'yinchi ID/username so'raydigan mahsulot — to'g'ridan-to'g'ri Robux.
+    if keys.intersection({"player_id", "user_id", "roblox_id", "username"}):
+        return "robux"
+
+    # Gift Card ekanini SKU yoki mahsulot nomi tasdiqlasa shu guruh.
+    if any(term in (sku_words + " " + product_words) for term in gift_terms):
+        return "gift_card"
+
+    # Faqat umumiy brand/kategoriya nomi asosida gift card deb belgilamaymiz.
+    # Email yoki recipient email maydoni odatda kod yuboriladigan kartani anglatadi.
+    if keys.intersection({"email", "recipient_email", "customer_email"}):
+        return "gift_card"
+    if any(term in brand_words for term in gift_terms):
+        return "gift_card"
     return ""
 
 
@@ -2730,15 +2759,19 @@ def sync_yupay_roblox_catalog():
             required_fields = product.get("required_fields") or []
             if not isinstance(required_fields, list):
                 required_fields = []
-            group = _yupay_group(brand, product, required_fields)
-            if not group:
-                log.warning("YuPay Roblox mahsuloti turi aniqlanmadi, o'tkazildi: %s", product.get("slug") or product.get("name"))
-                continue
             skus = product.get("skus") or []
             if not isinstance(skus, list):
                 continue
             for sku in skus:
                 if not isinstance(sku, dict):
+                    continue
+                group = _yupay_group(brand, product, required_fields, sku)
+                if not group:
+                    log.warning(
+                        "YuPay Roblox SKU turi aniqlanmadi, o'tkazildi: product=%s sku=%s",
+                        product.get("name") or product.get("slug"),
+                        sku.get("name") or sku.get("sku_code")
+                    )
                     continue
                 # fixed SKU — aniq nominal. Unit/amount turini noto'g'ri narxda sotmaslik uchun hozircha o'tkazamiz.
                 if str(sku.get("kind") or "fixed").lower() != "fixed":
