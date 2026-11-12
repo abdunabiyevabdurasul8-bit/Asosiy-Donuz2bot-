@@ -4500,12 +4500,13 @@ async def games_page(update, context, page):
 # FAQAT DATABASE'DAGI KATALOG ISHLATILADI
 # ============================================================
 
-async def game(update, context):
+async def game(update, context, callback_data=None):
 
     q = update.callback_query
 
+    # CallbackQuery.data read-only; synthetic navigation data is passed separately.
     try:
-        parts = q.data.split(":")
+        parts = (callback_data if callback_data is not None else q.data).split(":")
         game_id = int(parts[1])
         package_page = int(parts[2]) if len(parts) > 2 else 0
     except Exception:
@@ -8430,8 +8431,7 @@ async def callback_router(update, context):
         elif d in ("roblox_cat_robux", "roblox_cat_gift"):
             context.user_data["roblox_category"] = "robux" if d.endswith("robux") else "gift"
             context.user_data.pop("roblox_country", None)
-            q.data = f"g:{ROBLOX_GAME_ID}:0"
-            await game(update, context)
+            await game(update, context, f"g:{ROBLOX_GAME_ID}:0")
 
         elif d.startswith("roblox_country_"):
             try:
@@ -8441,8 +8441,7 @@ async def callback_router(update, context):
             except Exception:
                 await q.message.reply_text("❌ Davlat tanlovi eskirgan. Gift Cards bo'limini qayta oching.")
                 return
-            q.data = f"g:{ROBLOX_GAME_ID}:0"
-            await game(update, context)
+            await game(update, context, f"g:{ROBLOX_GAME_ID}:0")
 
         elif d.startswith("g:"):
 
