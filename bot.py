@@ -2472,79 +2472,132 @@ def _yupay_catalog_brands(data):
     return [x for x in brands if isinstance(x, dict)] if isinstance(brands, list) else []
 
 
+_ROBLOX_COUNTRY_ALIASES = {
+    "UNITED STATES": "United States", "UNITED STATES OF AMERICA": "United States", "USA": "United States", "US": "United States",
+    "UNITED KINGDOM": "United Kingdom", "UK": "United Kingdom", "GB": "United Kingdom",
+    "CANADA": "Canada", "CA": "Canada", "AUSTRALIA": "Australia", "AU": "Australia",
+    "GERMANY": "Germany", "DE": "Germany", "FRANCE": "France", "FR": "France",
+    "ITALY": "Italy", "IT": "Italy", "SPAIN": "Spain", "ES": "Spain",
+    "TURKEY": "Turkey", "TÜRKIYE": "Turkey", "TR": "Turkey", "INDIA": "India", "IN": "India",
+    "BRAZIL": "Brazil", "BR": "Brazil", "JAPAN": "Japan", "JP": "Japan",
+    "SOUTH KOREA": "South Korea", "KOREA": "South Korea", "KR": "South Korea",
+    "MEXICO": "Mexico", "MX": "Mexico", "SINGAPORE": "Singapore", "SG": "Singapore",
+    "SAUDI ARABIA": "Saudi Arabia", "SA": "Saudi Arabia", "UNITED ARAB EMIRATES": "United Arab Emirates", "UAE": "United Arab Emirates", "AE": "United Arab Emirates",
+    "NEW ZEALAND": "New Zealand", "NZ": "New Zealand", "SWITZERLAND": "Switzerland", "CH": "Switzerland",
+    "NETHERLANDS": "Netherlands", "NL": "Netherlands", "BELGIUM": "Belgium", "BE": "Belgium",
+    "AUSTRIA": "Austria", "AT": "Austria", "POLAND": "Poland", "PL": "Poland",
+    "PORTUGAL": "Portugal", "PT": "Portugal", "IRELAND": "Ireland", "IE": "Ireland",
+    "SWEDEN": "Sweden", "SE": "Sweden", "NORWAY": "Norway", "NO": "Norway",
+    "DENMARK": "Denmark", "DK": "Denmark", "FINLAND": "Finland", "FI": "Finland",
+    "GREECE": "Greece", "GR": "Greece", "CZECH REPUBLIC": "Czech Republic", "CZ": "Czech Republic",
+    "ROMANIA": "Romania", "RO": "Romania", "HUNGARY": "Hungary", "HU": "Hungary",
+    "SOUTH AFRICA": "South Africa", "ZA": "South Africa", "ARGENTINA": "Argentina", "AR": "Argentina",
+    "CHILE": "Chile", "CL": "Chile", "COLOMBIA": "Colombia", "CO": "Colombia",
+    "INDONESIA": "Indonesia", "ID": "Indonesia", "MALAYSIA": "Malaysia", "MY": "Malaysia",
+    "THAILAND": "Thailand", "TH": "Thailand", "PHILIPPINES": "Philippines", "PH": "Philippines",
+    "VIETNAM": "Vietnam", "VN": "Vietnam", "HONG KONG": "Hong Kong", "HK": "Hong Kong",
+    "TAIWAN": "Taiwan", "TW": "Taiwan", "ISRAEL": "Israel", "IL": "Israel",
+    "UKRAINE": "Ukraine", "UA": "Ukraine", "RUSSIA": "Russia", "RU": "Russia",
+    "GLOBAL": "Global", "WORLDWIDE": "Global", "WORLD WIDE": "Global", "ALL REGIONS": "Global"
+}
+
+def _roblox_country_from_catalog(*objects):
+    """Hududni YuPay katalogining explicit country/region metadata yoki nomlaridan topadi."""
+    explicit, labels = [], []
+    def walk(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_norm = str(key).lower().replace("-", "_")
+                if key_norm in ("country", "country_name", "country_code", "region", "region_name", "region_code", "market"):
+                    if isinstance(value, (str, int)):
+                        explicit.append(str(value))
+                    elif isinstance(value, dict):
+                        explicit.extend(str(x) for x in value.values() if isinstance(x, (str, int)))
+                if isinstance(value, (dict, list)):
+                    walk(value)
+                elif isinstance(value, str) and key_norm in ("name", "slug", "sku_code", "title", "label"):
+                    labels.append(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value)
+        elif isinstance(obj, str):
+            labels.append(obj)
+    for obj in objects:
+        walk(obj)
+    for value in explicit:
+        norm = re.sub(r"[_-]+", " ", value).strip().upper()
+        if norm in _ROBLOX_COUNTRY_ALIASES:
+            return _ROBLOX_COUNTRY_ALIASES[norm]
+    text = re.sub(r"[^A-Z0-9]+", " ", " ".join(labels).upper())
+    padded = " " + text + " "
+    for alias in sorted((x for x in _ROBLOX_COUNTRY_ALIASES if len(x) > 2), key=len, reverse=True):
+        token = re.sub(r"[^A-Z0-9]+", " ", alias).strip()
+        if " " + token + " " in padded:
+            return _ROBLOX_COUNTRY_ALIASES[alias]
+    for alias in ("US", "GB", "CA", "AU", "DE", "FR", "IT", "ES", "TR", "IN", "BR", "JP", "KR", "MX", "SG", "SA", "AE", "NZ", "CH", "NL", "BE", "AT", "PL", "PT", "IE", "SE", "NO", "DK", "FI", "GR", "CZ", "RO", "HU", "ZA", "AR", "CL", "CO", "ID", "MY", "TH", "PH", "VN", "HK", "TW", "IL", "UA", "RU"):
+        if " " + alias + " " in padded:
+            return _ROBLOX_COUNTRY_ALIASES[alias]
+    return "Global"
+
+
+def _roblox_giftcard_country_label(country):
+    return "Global (davlat ajratilmagan)" if str(country).lower() == "global" else str(country)
+
 def sync_roblox_catalog():
-    """Faqat Roblox SKUlarini YuPay'dan saqlaydi; gift-card va boshqa o'yinlar chetlanadi."""
+    """Robux va Gift Cards'ni YuPay category_slug bo'yicha alohida saqlaydi."""
     if not YUPAY_API_KEY:
         return False, "YUPAY_API_KEY Render Environment'ga kiritilmagan."
     status, data = yupay_request("GET", "/merchant/v1/catalog")
     if not data.get("ok"):
         return False, f"Roblox katalogini olishda xato (HTTP {status})."
 
-    brands = _yupay_catalog_brands(data)
-    roblox_products = []
-    for brand in brands:
+    catalog_items = []
+    for brand in _yupay_catalog_brands(data):
         brand_name = str(brand.get("name") or brand.get("title") or brand.get("slug") or "").strip()
-        products = brand.get("products") or []
-        if not isinstance(products, list):
-            continue
-        for product in products:
+        for product in (brand.get("products") or []):
             if not isinstance(product, dict):
                 continue
             product_name = str(product.get("name") or product.get("title") or product.get("slug") or "").strip()
-            searchable = (brand_name + " " + product_name).lower()
+            searchable = " ".join((brand_name, str(brand.get("slug") or ""), product_name, str(product.get("slug") or ""))).lower()
             if "roblox" not in searchable:
                 continue
-            # B2G Gift Cards hech qachon Roblox katalogiga tushmasin.
-            if "gift card" in searchable or "giftcard" in searchable or "b2g" in searchable:
-                continue
-            roblox_products.append((brand_name or "Roblox", product))
-    if not roblox_products:
-        return False, "YuPay katalogida mos Roblox paketi topilmadi."
+            category = str(brand.get("category_slug") or "").strip().lower()
+            if category == "top-ups":
+                section = "robux"
+            elif category == "gift-cards":
+                section = "gift"
+            else:
+                # Fallback faqat eski/bo'sh category_slug uchun.
+                section = "gift" if any(x in searchable for x in ("gift card", "giftcard", "b2g")) else "robux"
+            catalog_items.append((brand, product, section))
+
+    if not catalog_items:
+        return False, "YuPay katalogida Roblox top-ups yoki gift-cards mahsulotlari topilmadi."
 
     saved = 0
-    fields_for_game = []
+    fields_by_sku = {}
+    seen_package_ids = set()
+    seen_skus = set()
     now = datetime.now().isoformat()
     c = conn()
     try:
-        old_roblox = c.execute(
-            "SELECT game_id FROM games WHERE lower(name) LIKE '%%roblox%%' AND game_id<>?",
-            (ROBLOX_GAME_ID,),
-        ).fetchall()
-        for old_row in old_roblox:
-            c.execute("UPDATE games SET active=0 WHERE game_id=?", (old_row["game_id"],))
-            c.execute("UPDATE products SET active=0 WHERE game_id=?", (old_row["game_id"],))
-
-        # Explicit ON CONFLICT kaliti SQLite va PostgreSQL'da bir xil ishlaydi.
         c.execute(
             "INSERT INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) "
             "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id) DO UPDATE SET "
             "name=excluded.name,id_label=excluded.id_label,requires_server=excluded.requires_server,"
             "amount_based=excluded.amount_based,active=excluded.active,updated_at=excluded.updated_at,"
-            "provider_game_code=excluded.provider_game_code,game_fields_json=excluded.game_fields_json",
-            (ROBLOX_GAME_ID, "Roblox", "Roblox User ID", 0, 0, 1, now, "yupay:roblox", "[]"),
+            "provider_game_code=excluded.provider_game_code",
+            (ROBLOX_GAME_ID, "Roblox", "Roblox User ID", 0, 0, 1, now, "yupay:roblox", "{}"),
         )
-
-        seen_skus = set()
-        seen_package_ids = set()
-        for brand_name, product in roblox_products:
-            product_name = str(product.get("name") or product.get("title") or "Roblox").strip()
+        for brand, product, section in catalog_items:
             fields = product.get("required_fields") or []
-            if isinstance(fields, list) and fields and not fields_for_game:
-                fields_for_game = fields
-            skus = product.get("skus") or []
-            if not isinstance(skus, list):
-                continue
-            for sku in skus:
+            for sku in (product.get("skus") or []):
                 if not isinstance(sku, dict):
                     continue
-                sku_id = str(sku.get("sku_id") or sku.get("id") or "").strip()
-                sku_label = str(sku.get("name") or sku.get("title") or sku.get("sku_code") or "").lower()
-                if "gift card" in sku_label or "giftcard" in sku_label or "b2g" in sku_label:
-                    continue
+                sku_id = str(sku.get("sku_id") or "").strip()
                 if not sku_id or sku_id in seen_skus:
                     continue
-                kind = str(sku.get("kind") or "fixed").lower()
-                if kind != "fixed":
+                if str(sku.get("kind") or "fixed").lower() != "fixed":
                     continue
                 try:
                     usd = Decimal(str(sku.get("price_usd") or 0))
@@ -2552,41 +2605,40 @@ def sync_roblox_catalog():
                     continue
                 if usd <= 0:
                     continue
+                product_name = str(product.get("name") or product.get("title") or product.get("slug") or "Roblox").strip()
+                sku_name = str(sku.get("name") or sku.get("sku_code") or sku_id).strip()
+                if section == "gift":
+                    country = _roblox_country_from_catalog(brand, product, sku)
+                    package_name = f"Gift Card | {country} | {product_name} — {sku_name}"
+                else:
+                    package_name = f"Robux | {product_name} — {sku_name}"
                 api_uzs = usd * get_bay2game_usd_uzs()
                 sale_price = calc_roblox_sale_price(api_uzs)
-                sku_title = str(sku.get("name") or sku.get("title") or sku.get("sku_code") or sku_id)
-                package_name = f"{product_name} — {sku_title}"
                 paket_id = bay2game_internal_id("yupay:roblox:" + sku_id)
-                # Hash collision bo'lsa, shu SKUni qayta ishlash o'rniga xatoni aniq qayd etamiz.
                 if paket_id in seen_package_ids:
                     log.error("YuPay Roblox paket ID to'qnashuvi: %s", sku_id)
                     continue
                 seen_skus.add(sku_id)
                 seen_package_ids.add(paket_id)
+                fields_by_sku[sku_id] = fields if isinstance(fields, list) else []
                 stock = sku.get("stock")
-                active = 0 if sku.get("is_available") is False or str(stock).lower() in ("0", "false", "out_of_stock") else 1
+                active = 0 if stock is not None and str(stock).lower() in ("0", "false", "out_of_stock") else 1
                 c.execute(
                     "INSERT INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id,paket_id) DO UPDATE SET "
                     "game_name=excluded.game_name,package_name=excluded.package_name,price_usd=excluded.price_usd,"
                     "api_price_uzs=excluded.api_price_uzs,sale_price=excluded.sale_price,active=excluded.active,"
                     "updated_at=excluded.updated_at,provider_product_code=excluded.provider_product_code",
-                    (ROBLOX_GAME_ID, paket_id, "Roblox", package_name, float(usd), float(api_uzs),
-                     float(sale_price), active, now, sku_id),
+                    (ROBLOX_GAME_ID, paket_id, "Roblox", package_name, float(usd), float(api_uzs), float(sale_price), active, now, sku_id),
                 )
                 saved += 1
-
-        # Faqat B2G Gift Cards nomli eski yozuvlarni o'chirib qo'yamiz;
-        # boshqa o'yinlar va ularning narxlari o'zgarishsiz qoladi.
-        c.execute(
-            "UPDATE products SET active=0 WHERE game_id=? AND ("
-            "lower(COALESCE(game_name,'')) LIKE '%%b2g gift cards%%' "
-            "OR lower(COALESCE(package_name,'')) LIKE '%%b2g gift cards%%' "
-            "OR lower(COALESCE(package_name,'')) LIKE '%%gift card%%')",
-            (ROBLOX_GAME_ID,),
-        )
-        c.execute("UPDATE games SET game_fields_json=? WHERE game_id=?",
-                  (json.dumps(fields_for_game, ensure_ascii=False), ROBLOX_GAME_ID))
+        if seen_package_ids:
+            ids = sorted(seen_package_ids)
+            placeholders = ",".join("?" for _ in ids)
+            c.execute(f"UPDATE products SET active=0 WHERE game_id=? AND paket_id NOT IN ({placeholders})", [ROBLOX_GAME_ID] + ids)
+        else:
+            c.execute("UPDATE products SET active=0 WHERE game_id=?", (ROBLOX_GAME_ID,))
+        c.execute("UPDATE games SET game_fields_json=? WHERE game_id=?", (json.dumps(fields_by_sku, ensure_ascii=False), ROBLOX_GAME_ID))
         c.commit()
     except Exception as exc:
         c.rollback()
@@ -2595,17 +2647,21 @@ def sync_roblox_catalog():
     finally:
         c.close()
     if saved == 0:
-        return False, "Roblox katalogi olindi, lekin sotiladigan fixed paket topilmadi."
-    return True, f"Roblox katalogi yangilandi: {saved} ta paket."
+        return False, "YuPay katalogi olindi, lekin sotiladigan fixed SKU topilmadi."
+    try:
+        copied = sync_roblox_to_child_bots()
+    except Exception:
+        copied = 0
+        log.exception("Roblox katalogini ulangan botlarga tarqatishda xato")
+    return True, f"Roblox katalogi yangilandi: {saved} ta paket (Robux va Gift Cards alohida). Ulangan botlar: {copied} ta."
 
 
-def yupay_create_roblox_order(game_id, paket_id, player_id):
-    """Roblox uchun YuPay Merchant order; boshqa o'yinlar bu funksiyaga kirmaydi."""
+def yupay_create_roblox_order(game_id, paket_id, player_id, giftcard_fulfillment_data=None):
+    """Roblox Robux/Gift Card buyurtmasi faqat YuPay orqali yuboriladi."""
     c = conn()
     try:
         product = c.execute(
-            "SELECT provider_product_code,price_usd,package_name FROM products "
-            "WHERE game_id=? AND paket_id=? AND active=1",
+            "SELECT provider_product_code,price_usd,package_name FROM products WHERE game_id=? AND paket_id=? AND active=1",
             (int(game_id), int(paket_id)),
         ).fetchone()
         game = c.execute("SELECT game_fields_json FROM games WHERE game_id=?", (ROBLOX_GAME_ID,)).fetchone()
@@ -2614,17 +2670,27 @@ def yupay_create_roblox_order(game_id, paket_id, player_id):
     if not product or not product["provider_product_code"]:
         return 400, {"ok": False, "error": "Roblox SKU topilmadi."}
     try:
-        fields = json.loads(game["game_fields_json"] or "[]") if game else []
+        fields_map = json.loads(game["game_fields_json"] or "{}") if game else {}
+        fields = fields_map.get(str(product["provider_product_code"]), []) if isinstance(fields_map, dict) else fields_map
     except Exception:
         fields = []
     required = [f for f in fields if isinstance(f, dict) and f.get("required", True)]
+    is_gift_card = str(product["package_name"] or "").startswith("Gift Card |")
     fulfillment_data = {}
-    if required:
-        # Roblox hisob identifikatori katalogdagi birinchi majburiy maydonga yoziladi.
-        field = required[0]
-        key = str(field.get("key") or "player_id")
-        fulfillment_data[key] = str(player_id).strip()
-    else:
+    if is_gift_card:
+        fulfillment_data = dict(giftcard_fulfillment_data or {})
+        missing = [str(field.get("key") or "") for field in required if str(field.get("key") or "") not in fulfillment_data]
+        if missing:
+            return 400, {"ok": False, "error": "Gift Card uchun kerakli ma'lumotlar to'liq kiritilmagan."}
+    elif required:
+        key = str(required[0].get("key") or "player_id")
+        if player_id:
+            fulfillment_data[key] = str(player_id).strip()
+        else:
+            return 400, {"ok": False, "error": "Roblox User ID kiritilmagan."}
+    elif not is_gift_card:
+        if not player_id:
+            return 400, {"ok": False, "error": "Roblox User ID kiritilmagan."}
         fulfillment_data["player_id"] = str(player_id).strip()
     merchant_order_id = f"DONUZ-{uuid.uuid4().hex[:24].upper()}"
     payload = {
@@ -3014,7 +3080,7 @@ def api_post(path, body):
         player_id = str(body.get("player_id") or "").strip()
         server_id = str(body.get("server_id") or "").strip()
         if game_id == ROBLOX_GAME_ID:
-            return yupay_create_roblox_order(game_id, paket_id, player_id)
+            return yupay_create_roblox_order(game_id, paket_id, player_id, body.get("fulfillment_data"))
         c = conn()
         product = c.execute(
             "SELECT provider_product_code,price_usd FROM products WHERE game_id=? AND paket_id=? AND active=1",
@@ -4451,6 +4517,17 @@ async def game(update, context):
     except Exception:
         pass
 
+    if game_id == ROBLOX_GAME_ID and not context.user_data.get("roblox_category"):
+        await q.message.reply_text(
+            "🎮 Roblox bo'limini tanlang:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 Robux", callback_data="roblox_cat_robux")],
+                [InlineKeyboardButton("🎁 Gift Cards", callback_data="roblox_cat_gift")],
+                [InlineKeyboardButton("🔙 O'yinlarga qaytish", callback_data="games")],
+            ])
+        )
+        return
+
     c = conn()
     g = c.execute(
         "SELECT * FROM games WHERE game_id=? AND active=1",
@@ -4465,6 +4542,28 @@ async def game(update, context):
         (game_id,)
     ).fetchall()
     c.close()
+
+    if game_id == ROBLOX_GAME_ID:
+        category = context.user_data.get("roblox_category")
+        if category == "gift":
+            countries = sorted({
+                str(row["package_name"]).split("|", 2)[1].strip()
+                for row in rows
+                if str(row["package_name"] or "").startswith("Gift Card |")
+            })
+            selected_country = context.user_data.get("roblox_country")
+            if not selected_country:
+                if not countries:
+                    await q.message.reply_text("🎁 YuPay katalogida Gift Card davlat/hududlari topilmadi. Administrator katalogni yangilasin.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Roblox", callback_data="roblox_back_menu")]]))
+                    return
+                buttons = [[InlineKeyboardButton("🌍 " + _roblox_giftcard_country_label(country), callback_data="roblox_country_" + str(i))] for i, country in enumerate(countries)]
+                context.user_data["roblox_country_options"] = countries
+                buttons.append([InlineKeyboardButton("🔙 Roblox bo'limlari", callback_data="roblox_back_menu")])
+                await q.message.reply_text("🎁 Gift Card uchun davlat/hududni tanlang:", reply_markup=InlineKeyboardMarkup(buttons))
+                return
+            rows = [row for row in rows if str(row["package_name"] or "").startswith(f"Gift Card | {selected_country} |")]
+        elif category == "robux":
+            rows = [row for row in rows if str(row["package_name"] or "").startswith("Robux |")]
 
     # Paketlar lokal DB'da bo'lmasa, aynan tanlangan o'yin paketlarini
     # Bay2Game katalogidan yangilaymiz.
@@ -4504,6 +4603,8 @@ async def game(update, context):
         return
 
     game_name = g["name"]
+    if game_id == ROBLOX_GAME_ID:
+        game_name = "Roblox — " + ("Gift Cards" if context.user_data.get("roblox_category") == "gift" else "Robux")
     id_label = g["id_label"] or "Player ID"
     requires_server = bool(g["requires_server"])
 
@@ -4534,6 +4635,11 @@ async def game(update, context):
             price = sale if game_id == ROBLOX_GAME_ID else child_price(sale, markup)
             paket_id = int(r["paket_id"])
             package_name = str(r["package_name"] or "Paket")
+            if game_id == ROBLOX_GAME_ID:
+                if package_name.startswith("Gift Card |"):
+                    package_name = package_name.split(" | ", 2)[-1]
+                elif package_name.startswith("Robux | "):
+                    package_name = package_name.replace("Robux | ", "", 1)
         except Exception:
             skipped += 1
             continue
@@ -4665,19 +4771,25 @@ async def offer(update, context):
 
         return
 
+    is_roblox_gift = game_id == ROBLOX_GAME_ID and str(r["package_name"] or "").startswith("Gift Card |")
+    display_package = str(r["package_name"] or "Paket")
+    if game_id == ROBLOX_GAME_ID:
+        if display_package.startswith("Gift Card |"):
+            display_package = display_package.split(" | ", 2)[-1]
+        elif display_package.startswith("Robux | "):
+            display_package = display_package.replace("Robux | ", "", 1)
+
     context.user_data.update({
+        "is_roblox_giftcard": is_roblox_gift,
+        "giftcard_field_key": None,
 
         "game_id": game_id,
 
         "paket_id": paket_id,
 
-        "offer_name": r[
-            "package_name"
-        ],
+        "offer_name": display_package,
 
-        "game_name": r[
-            "game_name"
-        ],
+        "game_name": ("Roblox Gift Cards — " + str(r["package_name"]).split(" | ", 2)[1] if is_roblox_gift else ("Roblox Robux" if game_id == ROBLOX_GAME_ID else r["game_name"])),
 
         "price": (Decimal(str(r["sale_price"])) if game_id == ROBLOX_GAME_ID
                   else child_price(r["sale_price"], get_child_markup(context))),
@@ -4689,9 +4801,38 @@ async def offer(update, context):
         "state": "player_id"
     })
 
+    if is_roblox_gift:
+        c2 = conn()
+        game_row = c2.execute("SELECT game_fields_json FROM games WHERE game_id=?", (ROBLOX_GAME_ID,)).fetchone()
+        c2.close()
+        try:
+            fields_map = json.loads(game_row["game_fields_json"] or "{}") if game_row else {}
+            fields = fields_map.get(str(r["provider_product_code"]), []) if isinstance(fields_map, dict) else []
+            required_fields = [field for field in fields if isinstance(field, dict) and field.get("required", True)]
+        except Exception:
+            required_fields = []
+        if not required_fields:
+            context.user_data["player_id"] = ""
+            context.user_data["giftcard_fulfillment_data"] = {}
+            context.user_data["state"] = None
+            await confirm_order(q.message, context)
+            return
+        context.user_data["giftcard_required_fields"] = required_fields
+        context.user_data["giftcard_field_index"] = 0
+        context.user_data["giftcard_fulfillment_data"] = {}
+        first_field = required_fields[0]
+        field_label = first_field.get("label") or first_field.get("key") or "Ma'lumot"
+        if isinstance(field_label, dict):
+            field_label = field_label.get("uz") or field_label.get("en") or field_label.get("ru") or first_field.get("key")
+        context.user_data["giftcard_field_key"] = first_field.get("key")
+        context.user_data["id_label"] = str(field_label)
+        context.user_data["state"] = "roblox_gift_field"
+        await q.message.reply_text(f"🎁 {display_package}\n💰 Narx: {context.user_data['price']:,.0f} so'm\n\n{field_label} ni yuboring:\nBekor qilish uchun /cancel")
+        return
+
     await q.message.reply_text(
         f"🎮 {r['game_name']}\n"
-        f"📦 {r['package_name']}\n"
+        f"📦 {display_package}\n"
         f"💰 Narx: "
         f"{(Decimal(str(r['sale_price'])) if game_id == ROBLOX_GAME_ID else child_price(r['sale_price'], get_child_markup(context))):,.0f} so'm\n\n"
         f"🆔 {id_label} ni yuboring:\n\n"
@@ -4803,7 +4944,7 @@ async def confirm_order(
         f"🎮 {game_name}\n\n"
         f"📦 {context.user_data.get('offer_name','Paket')}\n"
         f"💰 Narx: {final_price:,.0f} so'm\n\n"
-        f"🆔 {id_label}: {player_id}\n"
+        + (f"🆔 {id_label}: {player_id}\n" if player_id else ("🎁 Yetkazish: Gift Card kodi\n" if context.user_data.get("is_roblox_giftcard") else "🆔 ID kiritilmagan\n"))
         + (f"👤 Nickname: {player_name}\n" if player_name else "")
         + extra
         + (f"🎁 Chegirma: {discount:,.0f} so'm\n" if discount else "")
@@ -4920,7 +5061,7 @@ async def confirm(update, context):
         )
     )
 
-    if not player_id:
+    if not player_id and not context.user_data.get("is_roblox_giftcard"):
 
         await q.message.reply_text(
             "❌ Player/User ID kiritilmagan."
@@ -4951,8 +5092,11 @@ async def confirm(update, context):
     body = {
         "game_id": int(game_id),
         "paket_id": int(paket_id),
-        "player_id": player_id
     }
+    if player_id or not context.user_data.get("is_roblox_giftcard"):
+        body["player_id"] = player_id
+    if context.user_data.get("is_roblox_giftcard"):
+        body["fulfillment_data"] = context.user_data.get("giftcard_fulfillment_data", {})
 
     if requires_server:
 
@@ -5074,8 +5218,8 @@ async def confirm(update, context):
     await q.message.reply_text(
         f"✅ Buyurtma yuborildi!\n\n"
         f"📦 {context.user_data.get('offer_name','Paket')}\n"
-        f"🆔 {id_label}: {player_id}\n"
-        f"{user_extra}"
+        + (f"🆔 {id_label}: {player_id}\n" if player_id else ("🎁 Yetkazish: Gift Card kodi\n" if context.user_data.get("is_roblox_giftcard") else ""))
+        + f"{user_extra}"
         f"💰 {price:,.0f} so'm\n"
         f"🔢 Buyurtma raqami: {playpay_id}\n"
         f"📊 Status: {order_status}",
@@ -5093,7 +5237,7 @@ async def confirm(update, context):
             f"🔗 Username: {_channel_username}\n🆔 Telegram ID: {uid}\n"
             f"🎮 Xizmat: {_game_title}\n"
             f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
-            f"🆔 O'yinchi ID: {player_id}\n"
+            + (f"🆔 O'yinchi ID: {player_id}\n" if player_id else ("🎁 Gift Card kodi\n" if context.user_data.get("is_roblox_giftcard") else ""))
             + (f"🌐 Server ID: {server_id}\n" if requires_server else "")
             + f"💰 Summa: {price:,.0f} so'm\n🔢 Buyurtma ID: {playpay_id or '-'}\n📊 Holat: {order_status}"
         )
@@ -5139,7 +5283,7 @@ async def confirm(update, context):
             f"🔗 Username: {tg_username}\n"
             f"🆔 Telegram ID: {uid}\n\n"
             f"🎮 O'yin: {game_name}\n"
-            f"🆔 O'yinchi ID: {player_id}\n"
+            + (f"🆔 O'yinchi ID: {player_id}\n" if player_id else ("🎁 Gift Card kodi\n" if context.user_data.get("is_roblox_giftcard") else ""))
             + (f"🌐 Server ID: {server_id}\n" if requires_server else "")
             + f"{package_icon} Paket: {package_name}\n"
             f"💰 Sotuv narxi: {price:,.0f} so'm\n"
@@ -5297,6 +5441,41 @@ async def text_handler(update, context):
     state = context.user_data.get(
         "state"
     )
+
+    if state == "roblox_gift_field":
+        fields = context.user_data.get("giftcard_required_fields", [])
+        index = int(context.user_data.get("giftcard_field_index", 0))
+        if index >= len(fields):
+            context.user_data["state"] = None
+            await update.message.reply_text("❌ Gift Card ma'lumotlari holati xato. Qaytadan boshlang.")
+            return
+        field = fields[index]
+        value = text.strip()
+        pattern = field.get("pattern")
+        if pattern:
+            try:
+                if not re.fullmatch(str(pattern), value):
+                    await update.message.reply_text("❌ Kiritilgan ma'lumot formati noto'g'ri. Qaytadan kiriting:")
+                    return
+            except re.error:
+                pass
+        key = str(field.get("key") or f"field_{index+1}")
+        context.user_data.setdefault("giftcard_fulfillment_data", {})[key] = value
+        index += 1
+        context.user_data["giftcard_field_index"] = index
+        if index < len(fields):
+            next_field = fields[index]
+            label = next_field.get("label") or next_field.get("key") or "Ma'lumot"
+            if isinstance(label, dict):
+                label = label.get("uz") or label.get("en") or label.get("ru") or next_field.get("key")
+            context.user_data["giftcard_field_key"] = next_field.get("key")
+            context.user_data["id_label"] = str(label)
+            await update.message.reply_text(f"{label} ni yuboring:")
+            return
+        context.user_data["player_id"] = ""
+        context.user_data["state"] = None
+        await confirm_order(update.message, context)
+        return
 
     if state in ("withdraw_amount", "withdraw_details"):
         if await handle_withdrawal_text(update, context, state, text):
@@ -8181,7 +8360,9 @@ async def callback_router(update, context):
     try:
 
         if d == "games":
-
+            context.user_data.pop("roblox_category", None)
+            context.user_data.pop("roblox_country", None)
+            context.user_data.pop("roblox_country_options", None)
             await games(
                 update,
                 context
@@ -8236,6 +8417,32 @@ async def callback_router(update, context):
                 update,
                 context
             )
+
+        elif d == "roblox_back_menu":
+            context.user_data.pop("roblox_category", None)
+            context.user_data.pop("roblox_country", None)
+            await q.message.reply_text("🎮 Roblox bo'limini tanlang:", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 Robux", callback_data="roblox_cat_robux")],
+                [InlineKeyboardButton("🎁 Gift Cards", callback_data="roblox_cat_gift")],
+                [InlineKeyboardButton("🔙 O'yinlarga qaytish", callback_data="games")],
+            ]))
+
+        elif d in ("roblox_cat_robux", "roblox_cat_gift"):
+            context.user_data["roblox_category"] = "robux" if d.endswith("robux") else "gift"
+            context.user_data.pop("roblox_country", None)
+            q.data = f"g:{ROBLOX_GAME_ID}:0"
+            await game(update, context)
+
+        elif d.startswith("roblox_country_"):
+            try:
+                index = int(d.rsplit("_", 1)[1])
+                countries = context.user_data.get("roblox_country_options", [])
+                context.user_data["roblox_country"] = countries[index]
+            except Exception:
+                await q.message.reply_text("❌ Davlat tanlovi eskirgan. Gift Cards bo'limini qayta oching.")
+                return
+            q.data = f"g:{ROBLOX_GAME_ID}:0"
+            await game(update, context)
 
         elif d.startswith("g:"):
 
