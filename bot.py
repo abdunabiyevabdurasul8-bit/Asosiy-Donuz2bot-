@@ -178,6 +178,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from telegram import (
+    Bot,
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -307,6 +308,161 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(__name__)
+
+
+# ============================================================
+# FOYDALANUVCHI CHATIDA BITTA BOT XABARI
+# ============================================================
+# Bot yuborgan keyingi matn oldingi bot xabarini edit qiladi.
+# Edit imkoni bo'lmasa oldingi bot xabarini o'chirib, yangisini yuboradi.
+# Faqat private chatlar: kanal/guruhdagi buyurtma va admin xabarlari saqlanadi.
+_UI_LAST_BOT_MESSAGE = {}
+_UI_MESSAGE_METHODS_PATCHED = False
+
+
+def _ui_private_chat_key(bot, chat_id):
+    try:
+        if hasattr(chat_id, "id"):
+            chat_id = chat_id.id
+        chat_id = int(chat_id)
+        if chat_id <= 0:
+            return None
+        return (int(getattr(bot, "id", 0) or 0), chat_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ui_message_id(result):
+    if isinstance(result, list):
+        result = result[-1] if result else None
+    return getattr(result, "message_id", None)
+
+
+def _install_single_message_mode():
+    global _UI_MESSAGE_METHODS_PATCHED
+    if _UI_MESSAGE_METHODS_PATCHED:
+        return
+
+    original_send_message = Bot.send_message
+
+    async def single_send_message(self, *args, **kwargs):
+        chat_id = kwargs.get("chat_id")
+        if chat_id is None and args:
+            chat_id = args[0]
+        message_text = kwargs.get("text")
+        if message_text is None and len(args) > 1:
+            message_text = args[1]
+
+        key = _ui_private_chat_key(self, chat_id)
+        previous_id = _UI_LAST_BOT_MESSAGE.get(key) if key else None
+
+        if key and previous_id and message_text is not None:
+            edit_kwargs = {
+                "chat_id": int(chat_id.id if hasattr(chat_id, "id") else chat_id),
+                "message_id": previous_id,
+                "text": message_text,
+            }
+            # Faqat editMessageText qo'llaydigan parametrlarni o'tkazamiz.
+            for name in (
+                "parse_mode",
+                "entities",
+                "link_preview_options",
+                "disable_web_page_preview",
+                "reply_markup",
+                "business_connection_id",
+                "read_timeout",
+                "write_timeout",
+                "connect_timeout",
+                "pool_timeout",
+                "api_kwargs",
+            ):
+                if name in kwargs:
+                    edit_kwargs[name] = kwargs[name]
+            try:
+                edited = await self.edit_message_text(**edit_kwargs)
+                new_id = _ui_message_id(edited)
+                if new_id:
+                    _UI_LAST_BOT_MESSAGE[key] = new_id
+                return edited
+            except Exception as edit_error:
+                # Masalan, oldingi xabar media bo'lsa yoki matnni edit qilib bo'lmasa.
+                try:
+                    await self.delete_message(
+                        chat_id=int(chat_id.id if hasattr(chat_id, "id") else chat_id),
+                        message_id=previous_id,
+                    )
+                except Exception:
+                    pass
+                _UI_LAST_BOT_MESSAGE.pop(key, None)
+                log.debug("Oldingi bot xabarini edit qilib bo'lmadi: %s", type(edit_error).__name__)
+
+        sent = await original_send_message(self, *args, **kwargs)
+        if key:
+            sent_id = _ui_message_id(sent)
+            if sent_id:
+                _UI_LAST_BOT_MESSAGE[key] = sent_id
+        return sent
+
+    Bot.send_message = single_send_message
+
+    # Foto/video/animatsiya kabi media yuborilganda matnli xabarni edit qilib bo'lmaydi:
+    # avvalgi bot xabari o'chiriladi, so'ng media yuboriladi.
+    for method_name in ("send_photo", "send_video", "send_animation", "send_document",
+                        "send_audio", "send_voice", "send_sticker", "send_location",
+                        "send_contact", "send_venue", "send_poll", "send_dice"):
+        original_method = getattr(Bot, method_name, None)
+        if original_method is None:
+            continue
+
+        def make_media_wrapper(original, name):
+            async def single_media_send(self, *args, **kwargs):
+                chat_id = kwargs.get("chat_id")
+                if chat_id is None and args:
+                    chat_id = args[0]
+                key = _ui_private_chat_key(self, chat_id)
+                previous_id = _UI_LAST_BOT_MESSAGE.get(key) if key else None
+                if key and previous_id:
+                    try:
+                        await self.delete_message(
+                            chat_id=int(chat_id.id if hasattr(chat_id, "id") else chat_id),
+                            message_id=previous_id,
+                        )
+                    except Exception:
+                        pass
+                    _UI_LAST_BOT_MESSAGE.pop(key, None)
+
+                result = await original(self, *args, **kwargs)
+                if key:
+                    sent_id = _ui_message_id(result)
+                    if sent_id:
+                        _UI_LAST_BOT_MESSAGE[key] = sent_id
+                return result
+            return single_media_send
+
+        setattr(Bot, method_name, make_media_wrapper(original_method, method_name))
+
+    # Xabar o'chirilsa, keyingi yuborishda eskirgan message_id ishlatilmasin.
+    original_delete_message = Bot.delete_message
+
+    async def tracked_delete_message(self, *args, **kwargs):
+        chat_id = kwargs.get("chat_id")
+        message_id = kwargs.get("message_id")
+        if chat_id is None and args:
+            chat_id = args[0]
+        if message_id is None and len(args) > 1:
+            message_id = args[1]
+        result = await original_delete_message(self, *args, **kwargs)
+        key = _ui_private_chat_key(self, chat_id)
+        if key and _UI_LAST_BOT_MESSAGE.get(key) == message_id:
+            _UI_LAST_BOT_MESSAGE.pop(key, None)
+        return result
+
+    Bot.delete_message = tracked_delete_message
+    _UI_MESSAGE_METHODS_PATCHED = True
+
+
+_install_single_message_mode()
+
 
 
 async def notify_order_channel(context, message):
