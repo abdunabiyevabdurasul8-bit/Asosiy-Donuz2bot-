@@ -1861,7 +1861,7 @@ async def bay2game_telegram_no_price(update, context):
     await q.message.reply_text("⚠️ Bu paket uchun narx yuklanmagan. Iltimos, boshqa paketni tanlang yoki keyinroq urinib ko'ring.")
 
 
-async def bay2game_telegram_game(update, context, game_id):
+async def bay2game_telegram_game(update, context, game_id, page=0):
     q = update.callback_query
     c = conn()
     try:
@@ -1885,14 +1885,35 @@ async def bay2game_telegram_game(update, context, game_id):
         if price <= 0:
             continue
         rows.append([InlineKeyboardButton(
-            f"{item['package_name']} — {price:,.0f} so'm",
+            f"{str(item['package_name'])[:38]} — {price:,.0f} so'm"[:64],
             callback_data=f"b2tg_pkg_{game_id}_{int(item['paket_id'])}"
         )])
-    rows.append([InlineKeyboardButton("🔙 Orqaga", callback_data="telegram_services")])
-    if len(rows) == 1:
+    if not rows:
         await q.message.reply_text("❌ Ushbu xizmat uchun narxli paket topilmadi.")
         return
-    await q.message.reply_text(f"📦 {game['name']} — paketni tanlang:", reply_markup=InlineKeyboardMarkup(rows))
+
+    page_size = 8
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = max(0, min(int(page), total_pages - 1))
+    page_rows = rows[page * page_size:(page + 1) * page_size]
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            "⬅️ Oldingi", callback_data=f"b2tg_gamepage_{game_id}_{page-1}"
+        ))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(
+            "Keyingi ➡️", callback_data=f"b2tg_gamepage_{game_id}_{page+1}"
+        ))
+    if nav:
+        page_rows.append(nav)
+    page_rows.append([InlineKeyboardButton("🔙 Orqaga", callback_data="telegram_services")])
+
+    await q.message.reply_text(
+        f"📦 {game['name']} — paketni tanlang ({page+1}/{total_pages}):",
+        reply_markup=InlineKeyboardMarkup(page_rows)
+    )
 
 
 async def bay2game_telegram_package(update, context, game_id, paket_id):
@@ -4193,23 +4214,62 @@ async def games(update, context):
         )
         return
 
+    # Telegram inline keyboard hajmi cheklanadi: o'yinlarni 10 tadan sahifalash.
+    await render_games_page(q, rows, page=0)
+
+
+async def render_games_page(q, rows, page=0):
+    page_size = 10
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = max(0, min(int(page), total_pages - 1))
+    current = rows[page * page_size:(page + 1) * page_size]
+
     kb = []
+    for r in current:
+        kb.append([InlineKeyboardButton(
+            "🎮 " + str(r["name"])[:55],
+            callback_data=f"g:{int(r['game_id'])}:0"
+        )])
 
-    for r in rows:
-
-        kb.append([
-            InlineKeyboardButton(
-                "🎮 " + r["name"],
-                callback_data=f"g:{r['game_id']}"
-            )
-        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"games_page_{page-1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"games_page_{page+1}"))
+    if nav:
+        kb.append(nav)
 
     await q.message.reply_text(
-        "🎮 O'yinni tanlang:",
-        reply_markup=InlineKeyboardMarkup(
-            kb[:100]
-        )
+        f"🎮 O'yinni tanlang (sahifa {page+1}/{total_pages}):",
+        reply_markup=InlineKeyboardMarkup(kb)
     )
+
+
+async def games_page(update, context, page):
+    q = update.callback_query
+    c = conn()
+    try:
+        rows = c.execute(
+            """
+            SELECT * FROM games
+            WHERE active=1
+            ORDER BY
+                CASE
+                    WHEN game_id=? THEN 0
+                    WHEN game_id=? THEN 1
+                    WHEN game_id=? THEN 2
+                    WHEN game_id=? THEN 3
+                    WHEN game_id=? THEN 4
+                    ELSE 5
+                END,
+                name
+            """,
+            (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID,
+             MOBILE_LEGENDS_GLOBAL_GAME_ID, ROBLOX_GAME_ID)
+        ).fetchall()
+    finally:
+        c.close()
+    await render_games_page(q, rows, page)
 
 
 # ============================================================
@@ -4223,7 +4283,9 @@ async def game(update, context):
     q = update.callback_query
 
     try:
-        game_id = int(q.data.split(":", 1)[1])
+        parts = q.data.split(":")
+        game_id = int(parts[1])
+        package_page = int(parts[2]) if len(parts) > 2 else 0
     except Exception:
         await q.message.reply_text("❌ O'yin ID xato.")
         return
@@ -4322,7 +4384,7 @@ async def game(update, context):
 
         kb.append([
             InlineKeyboardButton(
-                f"📦 {package_name} — {price:,.0f} so'm",
+                f"📦 {(package_name[:38] + '...') if len(package_name) > 38 else package_name} — {price:,.0f} so'm"[:64],
                 callback_data=f"o:{game_id}:{paket_id}"
             )
         ])
@@ -4331,12 +4393,25 @@ async def game(update, context):
         await q.message.reply_text("❌ Paketlar topilmadi.")
         return
 
-    # Paketlarni uzun ID+nom+narx ro'yxati qilib alohida yubormaymiz.
-    # Foydalanuvchi paketni tugmadan tanlaydi; keyin ID/username kiritadi.
+    # Telegram markup chekloviga tushmaslik uchun paketlar 8 tadan chiqariladi.
+    page_size = 8
+    total_pages = max(1, (len(kb) + page_size - 1) // page_size)
+    package_page = max(0, min(package_page, total_pages - 1))
+    page_buttons = kb[package_page * page_size:(package_page + 1) * page_size]
+
+    nav = []
+    if package_page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"g:{game_id}:{package_page-1}"))
+    if package_page + 1 < total_pages:
+        nav.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"g:{game_id}:{package_page+1}"))
+    if nav:
+        page_buttons.append(nav)
+    page_buttons.append([InlineKeyboardButton("🔙 O'yinlarga qaytish", callback_data="games")])
+
     await q.message.reply_text(
-        f"🎮 {game_name}\n\n"
-        "📦 Paketni tanlang:",
-        reply_markup=InlineKeyboardMarkup(kb)
+        f"🎮 {game_name}\\n\\n"
+        f"📦 Paketni tanlang (sahifa {package_page+1}/{total_pages}):",
+        reply_markup=InlineKeyboardMarkup(page_buttons)
     )
 
 
@@ -7884,6 +7959,9 @@ async def callback_router(update, context):
             return await bay2game_telegram_type(update, context, parts[2], int(parts[3]))
     if d == "b2tg_noprice":
         return await bay2game_telegram_no_price(update, context)
+    if d.startswith("b2tg_gamepage_"):
+        parts = d.split("_")
+        return await bay2game_telegram_game(update, context, int(parts[2]), int(parts[3]))
     if d.startswith("b2tg_game_"):
         return await bay2game_telegram_game(update, context, int(d.rsplit("_", 1)[1]))
     if d.startswith("b2tg_pkg_"):
@@ -7952,6 +8030,13 @@ async def callback_router(update, context):
                 update,
                 context
             )
+
+        elif d.startswith("games_page_"):
+            try:
+                return await games_page(update, context, int(d.rsplit("_", 1)[1]))
+            except Exception:
+                log.exception("O'yinlar sahifasini ochish xatosi")
+                return await q.message.reply_text("❌ O'yinlar ro'yxatini ochib bo'lmadi.")
 
         # Eski callback saqlangan.
         # Asosiy menyuda endi Balans tugmasi yo'q.
