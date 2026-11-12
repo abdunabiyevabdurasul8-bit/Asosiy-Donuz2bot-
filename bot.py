@@ -2707,10 +2707,18 @@ def _yupay_group(brand, product, required_fields, sku=None):
         product.get("name"), product.get("slug"), product.get("product_type"),
         product.get("type"),
     )).lower()
+    # YuPay ba'zan nominalni name/title emas, boshqa SKU maydonlarida beradi.
+    # SKU ichidagi barcha matnli qiymatlarni ham tekshiramiz.
     sku_words = " ".join(str(x or "") for x in (
         sku.get("name"), sku.get("sku_code"), sku.get("title"),
-        sku.get("description"), sku.get("kind"),
+        sku.get("description"), sku.get("kind"), sku.get("label"),
+        sku.get("display_name"), sku.get("amount"), sku.get("value"),
+        sku.get("denomination"), sku.get("unit"), sku.get("currency"),
     )).lower()
+    try:
+        sku_words += " " + json.dumps(sku, ensure_ascii=False, default=str).lower()
+    except Exception:
+        pass
     brand_words = " ".join(str(x or "") for x in (
         brand.get("category_name"), brand.get("category_slug"),
         brand.get("name"), brand.get("slug"),
@@ -4199,16 +4207,46 @@ async def roblox_category(update, context, group):
         return await q.message.reply_text("❌ Roblox bo'limi topilmadi.")
     c = conn()
     rows = c.execute(
-        "SELECT paket_id,package_name,sale_price FROM products WHERE game_id=? AND provider='yupay' AND provider_group=? AND active=1 ORDER BY package_name",
+        "SELECT paket_id,package_name,sale_price FROM products WHERE game_id=? AND provider='yupay' AND provider_group=? AND active=1",
         (ROBLOX_GAME_ID, group)
     ).fetchall()
     c.close()
     if not rows:
         return await q.message.reply_text("❌ Bu bo'limda hozircha paket yo'q. Admin katalogni yangilasin.")
     title = "💎 Robux" if group == "robux" else "🎁 Gift Card"
+
+    def _roblox_nominal(value):
+        raw = str(value or "")
+        match = re.search(r"\d[\d,._ ]*", raw)
+        if not match:
+            return float("inf")
+        digits = re.sub(r"[^0-9]", "", match.group(0))
+        try:
+            return int(digits) if digits else float("inf")
+        except Exception:
+            return float("inf")
+
+    # Bir xil nominaldagi takroriy SKUlar bitta tugma bo'lib chiqadi.
+    # Bir xil nominaldan bir nechta kelsa, eng arzonini qoldiramiz.
+    unique = {}
+    for row in rows:
+        package_name = str(row["package_name"] or "Roblox")
+        nominal = _roblox_nominal(package_name)
+        if group == "robux":
+            if "robux" not in package_name.lower():
+                package_name = f"{package_name} Robux"
+            dedupe_key = ("robux", nominal) if nominal != float("inf") else ("name", package_name.casefold())
+        else:
+            dedupe_key = ("name", re.sub(r"\s+", " ", package_name).strip().casefold())
+        old_row = unique.get(dedupe_key)
+        if old_row is None or float(row["sale_price"] or 0) < float(old_row["sale_price"] or 0):
+            unique[dedupe_key] = {"paket_id": row["paket_id"], "package_name": package_name, "sale_price": row["sale_price"]}
+
+    rows = sorted(unique.values(), key=lambda row: (_roblox_nominal(row["package_name"]), row["package_name"].casefold()))
     kb = []
     for row in rows:
         price = child_price(row["sale_price"], get_child_markup(context))
+        # Har bir paket alohida qatorda va narx to'liq so'mda ko'rsatiladi.
         kb.append([InlineKeyboardButton(f"📦 {row['package_name']} — {price:,.0f} so'm", callback_data=f"o:{ROBLOX_GAME_ID}:{int(row['paket_id'])}")])
     await _b2tg_edit_or_replace(
         q,
