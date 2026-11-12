@@ -1613,8 +1613,8 @@ def sync_roblox_to_child_bots():
             for product in products:
                 cc.execute(f"INSERT OR REPLACE INTO products({','.join(pcols)}) VALUES({','.join('?' for _ in pcols)})",
                            tuple(product[x] for x in pcols))
-            cc.execute("UPDATE products SET active=0 WHERE game_id=? AND (lower(package_name) LIKE '%b2g gift cards%' OR lower(package_name) LIKE '%gift card%')",
-                       (ROBLOX_GAME_ID,))
+            # Roblox Gift Card va Robux paketlari YuPay katalogidan keladi.
+            # Ulangan botga nusxalanganda ikkalasi ham faol holatda qoladi.
             cc.commit()
             cc.close()
             copied += 1
