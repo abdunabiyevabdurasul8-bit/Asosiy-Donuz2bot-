@@ -158,6 +158,7 @@ import asyncio
 import threading
 import contextvars
 import hashlib
+import hmac
 import base64
 import html
 import re
@@ -211,6 +212,15 @@ PLAYPAY_API_KEY = os.getenv("PLAYPAY_API_KEY", "").strip()
 PLAYPAY_BASE = os.getenv("PLAYPAY_BASE", "https://playpay.uz/api/v1").rstrip("/")
 ORDER_CHANNEL_ID = os.getenv("ORDER_CHANNEL_ID", "@Donuz_Buyurtmlar").strip() or "@Donuz_Buyurtmlar"
 BAY2GAME_BASE = os.getenv("BAY2GAME_BASE", "https://api.bay2game.xyz/api").rstrip("/")
+# YuPay faqat Roblox katalogi/buyurtmalari uchun ishlatiladi.
+YUPAY_BASE = os.getenv("YUPAY_BASE", "https://api.yupay.uz/merchant/v1").rstrip("/")
+YUPAY_API_KEY = os.getenv("YUPAY_API_KEY", "").strip()  # ypk_... Bearer kaliti
+YUPAY_KEY_ID = os.getenv("YUPAY_KEY_ID", "").strip()    # ypm_... HMAC kalit ID
+YUPAY_SECRET = os.getenv("YUPAY_SECRET", "").strip()    # ypms_... HMAC maxfiy kalit
+try:
+    YUPAY_USD_UZS = Decimal(os.getenv("YUPAY_USD_UZS", os.getenv("BAY2GAME_USD_UZS", "13000")))
+except Exception:
+    YUPAY_USD_UZS = Decimal("13000")
 # Bay2Game narxlari USD da. Kurs Render ENV orqali beriladi; admin ustamasi bot ichida boshqariladi.
 try:
     BAY2GAME_USD_UZS = Decimal(os.getenv("BAY2GAME_USD_UZS", "13000"))
@@ -223,6 +233,7 @@ PUBG_GLOBAL_GAME_ID = 142  # PUBG Mobile Global, alohida API katalogi bo'lsa
 MOBILE_LEGENDS_GAME_ID = 54
 MOBILE_LEGENDS_GLOBAL_GAME_ID = 143
 GRAND_MOBILE_GAME_ID = 999001
+ROBLOX_GAME_ID = 999002
 
 # Grand Mobile — faqat manual buyurtma, narxlar o'zgartirilmaydi
 GRAND_MOBILE_PRICES = {
@@ -1089,13 +1100,33 @@ def ensure_external_schema():
 
         # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
         for table, cols in {
-            "games": {"provider_game_code": "TEXT DEFAULT ''", "game_fields_json": "TEXT DEFAULT '[]'"},
-            "products": {"provider_product_code": "TEXT DEFAULT ''"},
+            "games": {
+                "provider_game_code": "TEXT DEFAULT ''",
+                "game_fields_json": "TEXT DEFAULT '[]'",
+                "provider": "TEXT DEFAULT 'bay2game'",
+            },
+            "products": {
+                "provider_product_code": "TEXT DEFAULT ''",
+                "provider": "TEXT DEFAULT 'bay2game'",
+                "provider_group": "TEXT DEFAULT ''",
+                "provider_required_fields_json": "TEXT DEFAULT '[]'",
+                "provider_sku_kind": "TEXT DEFAULT 'fixed'",
+                "provider_price_usd": "TEXT DEFAULT ''",
+            },
         }.items():
             present = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
             for col, typ in cols.items():
                 if col not in present:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS provider_refunds(
+                provider_order_id TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS external_orders(
@@ -1374,12 +1405,13 @@ def copy_catalog_to_child(db_path):
     game_cols = {row[1] for row in c.execute("PRAGMA table_info(games)").fetchall()}
     product_cols = {row[1] for row in c.execute("PRAGMA table_info(products)").fetchall()}
     game_fields = ["game_id", "name", "id_label", "requires_server", "amount_based", "active", "updated_at"]
-    for optional in ("provider_game_code", "game_fields_json"):
+    for optional in ("provider_game_code", "game_fields_json", "provider"):
         if optional in game_cols:
             game_fields.append(optional)
     product_fields = ["game_id", "paket_id", "game_name", "package_name", "price_usd", "api_price_uzs", "sale_price", "active", "updated_at"]
-    if "provider_product_code" in product_cols:
-        product_fields.append("provider_product_code")
+    for optional in ("provider_product_code", "provider", "provider_group", "provider_required_fields_json", "provider_sku_kind", "provider_price_usd"):
+        if optional in product_cols:
+            product_fields.append(optional)
 
     game_sql = (
         f"INSERT OR REPLACE INTO games({','.join(game_fields)}) "
@@ -1425,6 +1457,13 @@ async def start_child_bot(bot_id):
     row = child_bot_row(bot_id)
     if not row or not child_active(row):
         return
+    old_db = CURRENT_DB.get()
+    CURRENT_DB.set(row["db_path"])
+    try:
+        init_db()
+        ensure_external_schema()
+    finally:
+        CURRENT_DB.set(old_db or MAIN_DB)
     token = decrypt_token(row["token_enc"])
     app = build_application(token, child=True)
     CHILD_APPS[bot_id] = app
@@ -2580,6 +2619,254 @@ def get_playpay_balance():
 
 
 # ============================================================
+# YUPAY — FAQAT ROBLOX KATALOGI VA BUYURTMALARI
+# ============================================================
+
+def yupay_request(method, path, body=None):
+    """YuPay Merchant API. Bearer kalit yoki hujjatdagi HMAC imzosi bilan ishlaydi."""
+    method = str(method or "GET").upper()
+    raw_path = "/merchant/v1" + ("/" + str(path or "").lstrip("/") if path else "")
+    url = YUPAY_BASE + ("/" + str(path or "").lstrip("/") if path else "")
+    body_bytes = b"" if body is None else json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+
+    if YUPAY_API_KEY:
+        headers["Authorization"] = "Bearer " + YUPAY_API_KEY
+    elif YUPAY_KEY_ID and YUPAY_SECRET:
+        timestamp = str(int(datetime.utcnow().timestamp()))
+        digest = hashlib.sha256(body_bytes).hexdigest()
+        canonical = "\n".join((timestamp, method, raw_path, "", digest))
+        signature = hmac.new(YUPAY_SECRET.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        headers.update({
+            "X-Merchant-Key": YUPAY_KEY_ID,
+            "X-Merchant-Timestamp": timestamp,
+            "X-Merchant-Signature": signature,
+        })
+    else:
+        return 503, {"ok": False, "error": "YUPAY_API_KEY yoki YUPAY_KEY_ID/YUPAY_SECRET sozlanmagan."}
+
+    try:
+        response = requests.request(method, url, headers=headers, data=body_bytes if body is not None else None, timeout=35)
+        try:
+            data = response.json()
+        except Exception:
+            data = {"error": response.text[:500]}
+        if not isinstance(data, dict):
+            data = {"data": data}
+        data["http_status"] = response.status_code
+        if response.status_code >= 400:
+            data["ok"] = False
+            data.setdefault("error", data.get("detail") or data.get("message") or f"HTTP {response.status_code}")
+        else:
+            data["ok"] = data.get("ok", data.get("success", True)) is not False
+        log.info("YuPay API %s %s HTTP=%s ok=%s", method, path, response.status_code, data.get("ok"))
+        return response.status_code, data
+    except Exception as exc:
+        log.exception("YuPay API so'rovida xato")
+        return 0, {"ok": False, "error": str(exc)}
+
+
+def get_yupay_catalog():
+    status, data = yupay_request("GET", "/catalog")
+    if not data.get("ok"):
+        return status, data, []
+    brands = data.get("brands")
+    if not isinstance(brands, list):
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            brands = nested.get("brands", [])
+        elif isinstance(nested, list):
+            brands = nested
+        else:
+            brands = []
+    return status, data, [x for x in brands if isinstance(x, dict)] if isinstance(brands, list) else []
+
+
+def _yupay_field_keys(fields):
+    return {str(x.get("key") or "").strip().lower() for x in fields if isinstance(x, dict)} if isinstance(fields, list) else set()
+
+
+def _yupay_group(brand, product, required_fields):
+    words = " ".join(str(x or "") for x in (
+        brand.get("category_name"), brand.get("category_slug"),
+        product.get("name"), product.get("slug"),
+    )).lower()
+    if any(x in words for x in ("gift", "giftcard", "gift-card", "voucher", "card", "подар", "ваучер", "карта")):
+        return "gift_card"
+    keys = _yupay_field_keys(required_fields)
+    if "robux" in words or keys.intersection({"player_id", "user_id", "roblox_id", "username"}):
+        return "robux"
+    return ""
+
+
+def sync_yupay_roblox_catalog():
+    """YuPay katalogidan faqat Roblox SKUlarini Robux/Gift Card qilib saqlaydi."""
+    status, response, brands = get_yupay_catalog()
+    if not response.get("ok"):
+        return False, "YuPay katalogini olishda xato: " + str(response.get("error") or status)
+
+    roblox_brands = [b for b in brands if "roblox" in (str(b.get("slug") or "") + " " + str(b.get("name") or "")).lower()]
+    if not roblox_brands:
+        return False, "YuPay katalogida Roblox brendi topilmadi. Mavjud o'yinlar o'zgartirilmadi."
+
+    prepared = []
+    for brand in roblox_brands:
+        products = brand.get("products") or []
+        if not isinstance(products, list):
+            continue
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            required_fields = product.get("required_fields") or []
+            if not isinstance(required_fields, list):
+                required_fields = []
+            group = _yupay_group(brand, product, required_fields)
+            if not group:
+                log.warning("YuPay Roblox mahsuloti turi aniqlanmadi, o'tkazildi: %s", product.get("slug") or product.get("name"))
+                continue
+            skus = product.get("skus") or []
+            if not isinstance(skus, list):
+                continue
+            for sku in skus:
+                if not isinstance(sku, dict):
+                    continue
+                # fixed SKU — aniq nominal. Unit/amount turini noto'g'ri narxda sotmaslik uchun hozircha o'tkazamiz.
+                if str(sku.get("kind") or "fixed").lower() != "fixed":
+                    log.warning("YuPay Roblox fixed bo'lmagan SKU o'tkazildi: %s", sku.get("sku_code"))
+                    continue
+                sku_id = str(sku.get("sku_id") or "").strip()
+                if not sku_id:
+                    continue
+                try:
+                    usd = Decimal(str(sku.get("price_usd") or "0"))
+                except Exception:
+                    continue
+                if usd <= 0:
+                    continue
+                fallback_rate = get_setting("bay2game_usd_uzs", YUPAY_USD_UZS)
+                api_uzs = usd * Decimal(str(get_setting("yupay_usd_uzs", fallback_rate) or fallback_rate))
+                sale_price = calc_sale_price(api_uzs)
+                sku_name = str(sku.get("name") or sku.get("sku_code") or product.get("name") or sku_id)
+                product_name = str(product.get("name") or product.get("slug") or "Roblox")
+                prepared.append({
+                    "sku_id": sku_id, "group": group, "name": sku_name,
+                    "product_name": product_name, "usd": usd,
+                    "api_uzs": api_uzs, "sale_price": sale_price,
+                    "required_fields": required_fields,
+                    "sku_kind": "fixed",
+                })
+
+    if not prepared:
+        return False, "Roblox uchun sotuvga yaroqli fixed SKU topilmadi. Mavjud katalog o'zgartirilmadi."
+
+    now = datetime.now().isoformat()
+    c = conn()
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json,provider) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (ROBLOX_GAME_ID, "Roblox", "Roblox ID", 0, 0, 1, now, "roblox", "[]", "yupay")
+        )
+        # Eski provayderdan qolgan Roblox qatorlari ham foydalanuvchiga chiqmasin.
+        c.execute("UPDATE games SET active=0 WHERE LOWER(COALESCE(name,'')) LIKE '%roblox%' AND COALESCE(provider,'bay2game')!='yupay' AND game_id!=?", (ROBLOX_GAME_ID,))
+        c.execute("UPDATE products SET active=0 WHERE LOWER(COALESCE(game_name,'')) LIKE '%roblox%' AND COALESCE(provider,'bay2game')!='yupay'")
+        c.execute("UPDATE products SET active=0 WHERE game_id=? AND provider='yupay'", (ROBLOX_GAME_ID,))
+        for item in prepared:
+            paket_id = bay2game_internal_id("yupay:" + item["sku_id"])
+            c.execute(
+                """INSERT OR REPLACE INTO products(
+                    game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,
+                    provider_product_code,provider,provider_group,provider_required_fields_json,provider_sku_kind,provider_price_usd
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (ROBLOX_GAME_ID, paket_id, "Roblox", item["name"], float(item["usd"]), float(item["api_uzs"]),
+                 float(item["sale_price"]), 1, now, item["sku_id"], "yupay", item["group"],
+                 json.dumps(item["required_fields"], ensure_ascii=False), item["sku_kind"], str(item["usd"]))
+            )
+        c.commit()
+    except Exception:
+        c.rollback()
+        log.exception("YuPay Roblox katalogini DB ga yozishda xato")
+        return False, "Roblox katalogini saqlashda xato."
+    finally:
+        c.close()
+
+    counts = {"robux": 0, "gift_card": 0}
+    for item in prepared:
+        counts[item["group"]] = counts.get(item["group"], 0) + 1
+    return True, f"Roblox katalogi yangilandi: {counts['robux']} ta Robux, {counts['gift_card']} ta Gift Card paketi."
+
+
+def get_yupay_order(merchant_order_id):
+    from urllib.parse import quote
+    status, data = yupay_request("GET", "/orders/" + quote(str(merchant_order_id), safe=""))
+    if not data.get("ok"):
+        return status, data
+    order = data.get("order") if isinstance(data.get("order"), dict) else data
+    delivery = order.get("delivery") if isinstance(order.get("delivery"), dict) else {}
+    artifact = delivery.get("artifact") if isinstance(delivery.get("artifact"), dict) else {}
+    code = artifact.get("code")
+    if not code and isinstance(artifact.get("codes"), list):
+        code = "\n".join(str(x) for x in artifact["codes"])
+    return status, {
+        "ok": True,
+        "order": order,
+        "status": str(order.get("status") or "paid").lower(),
+        "delivery_code": str(code or ""),
+        "failure_reason": str(order.get("failure_reason") or ""),
+        "refunded_usd": str(order.get("refunded_usd") or "0"),
+        "price_usd": str(order.get("price_usd") or "0"),
+        "order_id": str(order.get("order_id") or merchant_order_id),
+    }
+
+
+def yupay_place_order(sku_id, expected_price, fulfillment_data, merchant_order_id):
+    payload = {
+        "expected_price": str(expected_price),
+        "fulfillment_data": fulfillment_data or {},
+        "merchant_order_id": str(merchant_order_id),
+        "sku_id": str(sku_id),
+    }
+    status, created = yupay_request("POST", "/orders", payload)
+    if not created.get("ok"):
+        # Tarmoq uzilib qolgan bo'lsa, idempotency ID bilan buyurtma yaratilganini tekshiramiz.
+        check_status, check = get_yupay_order(merchant_order_id)
+        if check.get("ok"):
+            return check_status, check
+        # 5xx/timeout holatida POST serverda bajarilgan bo'lishi mumkin.
+        # Bunday vaziyatda mijozga pulni qaytarib yuborib, providerda buyurtma qolishiga yo'l qo'ymaymiz.
+        if status == 0 or int(status or 0) >= 500:
+            return status, {
+                "ok": True, "order_id": str(merchant_order_id), "status": "paid",
+                "delivery_code": "", "failure_reason": "status_check_pending",
+                "refunded_usd": "0", "price_usd": str(expected_price),
+            }
+        return status, {"ok": False, "error": created.get("error") or created.get("detail") or "YuPay buyurtmani qabul qilmadi."}
+    check_status, check = get_yupay_order(merchant_order_id)
+    if check.get("ok"):
+        return check_status, check
+    # POST muvaffaqiyatli bo'ldi: status endpoint vaqtincha ishlamasa ham pulni qaytarmaymiz.
+    nested = created.get("order") if isinstance(created.get("order"), dict) else created
+    return status, {
+        "ok": True, "order_id": str(nested.get("order_id") or merchant_order_id),
+        "status": str(nested.get("status") or "paid").lower(),
+        "delivery_code": "", "failure_reason": "", "refunded_usd": "0", "price_usd": str(expected_price),
+    }
+
+
+def _yupay_field_label(field):
+    key = str(field.get("key") or "field")
+    label = field.get("label")
+    if isinstance(label, dict):
+        label = label.get("uz") or label.get("ru") or label.get("en") or ""
+    label = str(label or "").strip()
+    if label:
+        return label
+    defaults = {"player_id": "Roblox ID", "user_id": "Roblox ID", "username": "Roblox username", "email": "Email"}
+    return defaults.get(key.lower(), key.replace("_", " ").title())
+
+
+# ============================================================
 # NARX
 # ============================================================
 
@@ -2915,6 +3202,9 @@ def sync_catalog():
             category.get("name") or category.get("game_name") or category.get("gameName") or
             category.get("category_name") or category.get("title") or category.get("slug") or game_code
         ).strip()
+        # Roblox katalogi faqat YuPay'dan olinadi; bu provider uni yozmasin.
+        if "roblox" in name.lower() or "roblox" in game_code.lower():
+            continue
         # API qaytargan o'yinlarni to'liq ko'rsatamiz; nomi PUBG Delay bo'lsa ham yashirmaymiz.
         # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
         region = str(category.get("region") or category.get("server") or category.get("version") or "").strip()
@@ -3379,6 +3669,7 @@ def admin_kb(context=None):
     ]
     if show_platform_controls:
         rows.append([InlineKeyboardButton("🔄 Katalog", callback_data="a_sync")])
+        rows.append([InlineKeyboardButton("🎮 Roblox katalogi (YuPay)", callback_data="a_yupay_roblox_sync")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3852,6 +4143,26 @@ async def games(update, context):
     )
 
 
+async def roblox_category(update, context, group):
+    q = update.callback_query
+    if group not in ("robux", "gift_card"):
+        return await q.message.reply_text("❌ Roblox bo'limi topilmadi.")
+    c = conn()
+    rows = c.execute(
+        "SELECT paket_id,package_name,sale_price FROM products WHERE game_id=? AND provider='yupay' AND provider_group=? AND active=1 ORDER BY package_name",
+        (ROBLOX_GAME_ID, group)
+    ).fetchall()
+    c.close()
+    if not rows:
+        return await q.message.reply_text("❌ Bu bo'limda hozircha paket yo'q. Admin katalogni yangilasin.")
+    title = "💎 Robux" if group == "robux" else "🎁 Gift Card"
+    kb = []
+    for row in rows:
+        price = child_price(row["sale_price"], get_child_markup(context))
+        kb.append([InlineKeyboardButton(f"📦 {row['package_name']} — {price:,.0f} so'm", callback_data=f"o:{ROBLOX_GAME_ID}:{int(row['paket_id'])}")])
+    await q.message.reply_text(f"{title}\n\nPaketni tanlang:", reply_markup=InlineKeyboardMarkup(kb[:100]))
+
+
 # ============================================================
 # GAME PACKAGES
 # BU YERDA API'DAN OLINMAYDI
@@ -3890,7 +4201,7 @@ async def game(update, context):
 
     # Paketlar lokal DB'da bo'lmasa, aynan tanlangan o'yin paketlarini
     # Bay2Game katalogidan yangilaymiz.
-    if g and not rows:
+    if g and not rows and game_id != ROBLOX_GAME_ID:
         try:
             data = await asyncio.to_thread(get_packages_api, game_id)
             if data:
@@ -3917,6 +4228,23 @@ async def game(update, context):
             "Iltimos, keyinroq tugmasini bosib yangilang."
         )
         return
+
+    if game_id == ROBLOX_GAME_ID:
+        c = conn()
+        groups = c.execute(
+            "SELECT provider_group,COUNT(*) AS n FROM products WHERE game_id=? AND provider='yupay' AND active=1 GROUP BY provider_group",
+            (ROBLOX_GAME_ID,)
+        ).fetchall()
+        c.close()
+        available = {str(row["provider_group"]): int(row["n"] or 0) for row in groups}
+        kb = []
+        if available.get("robux"):
+            kb.append([InlineKeyboardButton("💎 Robux", callback_data="rbcat:robux")])
+        if available.get("gift_card"):
+            kb.append([InlineKeyboardButton("🎁 Gift Card", callback_data="rbcat:gift_card")])
+        if not kb:
+            return await q.message.reply_text("❌ Roblox katalogi hali yuklanmagan. Admin Roblox katalogini yangilasin.")
+        return await q.message.reply_text("🎮 Roblox\n\nBo'limni tanlang:", reply_markup=InlineKeyboardMarkup(kb))
 
     if not rows:
         await q.message.reply_text(
@@ -4071,6 +4399,32 @@ async def offer(update, context):
 
         return
 
+    provider = str(r["provider"] or "bay2game") if "provider" in r.keys() else "bay2game"
+    if provider == "yupay":
+        try:
+            required_fields = json.loads(r["provider_required_fields_json"] or "[]")
+        except Exception:
+            required_fields = []
+        required_fields = [x for x in required_fields if isinstance(x, dict) and x.get("required", True)]
+        context.user_data.update({
+            "game_id": game_id, "paket_id": paket_id,
+            "offer_name": r["package_name"], "game_name": r["game_name"],
+            "price": child_price(r["sale_price"], get_child_markup(context)),
+            "id_label": "Roblox ma'lumoti", "requires_server": False,
+            "provider": "yupay", "yupay_sku_id": str(r["provider_product_code"] or ""),
+            "yupay_expected_price": str(r["provider_price_usd"] or r["price_usd"]),
+            "yupay_required_fields": required_fields, "yupay_field_index": 0,
+            "yupay_fulfillment_data": {}, "player_id": "", "state": "yupay_field" if required_fields else None,
+        })
+        if required_fields:
+            field = required_fields[0]
+            await q.message.reply_text(
+                f"🎮 Roblox — {r['package_name']}\n💰 Narx: {child_price(r['sale_price'], get_child_markup(context)):,.0f} so'm\n\n"
+                f"{_yupay_field_label(field)} ni yuboring:\nBekor qilish uchun /cancel"
+            )
+            return
+        return await confirm_order(q.message, context)
+
     context.user_data.update({
 
         "game_id": game_id,
@@ -4169,10 +4523,12 @@ async def confirm_order(
     ] = final_price
 
     player_id = str(
-        context.user_data.get(
-            "player_id",
-            ""
-        )
+        context.user_data.get("player_id")
+        or (context.user_data.get("yupay_fulfillment_data") or {}).get("player_id")
+        or (context.user_data.get("yupay_fulfillment_data") or {}).get("user_id")
+        or (context.user_data.get("yupay_fulfillment_data") or {}).get("username")
+        or (context.user_data.get("yupay_fulfillment_data") or {}).get("email")
+        or ""
     ).strip()
 
     server_id = str(
@@ -4198,6 +4554,10 @@ async def confirm_order(
             f"🌐 Server ID: {server_id}\n"
         )
 
+    if context.user_data.get("provider") == "yupay":
+        for field_key, field_value in (context.user_data.get("yupay_fulfillment_data") or {}).items():
+            extra += f"📝 {str(field_key).replace('_', ' ').title()}: {field_value}\n"
+
     game_name = context.user_data.get('game_name') or context.user_data.get('offer_game_name') or ''
     if not game_name:
         game_name = context.user_data.get('offer_name', 'O\'yin')
@@ -4208,7 +4568,7 @@ async def confirm_order(
         f"🎮 {game_name}\n\n"
         f"📦 {context.user_data.get('offer_name','Paket')}\n"
         f"💰 Narx: {final_price:,.0f} so'm\n\n"
-        f"🆔 {id_label}: {player_id}\n"
+        + (f"🆔 {id_label}: {player_id}\n" if player_id else "")
         + (f"👤 Nickname: {player_name}\n" if player_name else "")
         + extra
         + (f"🎁 Chegirma: {discount:,.0f} so'm\n" if discount else "")
@@ -4304,11 +4664,14 @@ async def confirm(update, context):
         "paket_id"
     )
 
+    yupay_fulfillment_data = context.user_data.get("yupay_fulfillment_data") or {}
     player_id = str(
-        context.user_data.get(
-            "player_id",
-            ""
-        )
+        context.user_data.get("player_id")
+        or yupay_fulfillment_data.get("player_id")
+        or yupay_fulfillment_data.get("user_id")
+        or yupay_fulfillment_data.get("roblox_id")
+        or yupay_fulfillment_data.get("username")
+        or ""
     ).strip()
 
     server_id = str(
@@ -4325,7 +4688,15 @@ async def confirm(update, context):
         )
     )
 
-    if not player_id:
+    c = conn()
+    product_row = c.execute(
+        "SELECT provider,provider_product_code,provider_price_usd,price_usd,provider_group FROM products WHERE game_id=? AND paket_id=? AND active=1",
+        (int(game_id or 0), int(paket_id or 0))
+    ).fetchone()
+    c.close()
+    order_provider = str(product_row["provider"] or "bay2game") if product_row and "provider" in product_row.keys() else "bay2game"
+
+    if order_provider != "yupay" and not player_id:
 
         await q.message.reply_text(
             "❌ Player/User ID kiritilmagan."
@@ -4383,11 +4754,20 @@ async def confirm(update, context):
     # BAY2GAME
     # ========================================================
 
-    status, data = await asyncio.to_thread(
-        api_post,
-        "/order",
-        body
-    )
+    if order_provider == "yupay":
+        fulfillment_data = yupay_fulfillment_data
+        sku_id = str(product_row["provider_product_code"] or context.user_data.get("yupay_sku_id") or "")
+        expected_price = str(product_row["provider_price_usd"] or product_row["price_usd"] or context.user_data.get("yupay_expected_price") or "0")
+        merchant_order_id = f"donuz-{uid}-{uuid.uuid4().hex}"
+        status, data = await asyncio.to_thread(
+            yupay_place_order, sku_id, expected_price, fulfillment_data, merchant_order_id
+        )
+    else:
+        status, data = await asyncio.to_thread(
+            api_post,
+            "/order",
+            body
+        )
 
     if not data.get("ok"):
 
@@ -4419,10 +4799,30 @@ async def confirm(update, context):
         ""
     )
 
-    order_status = data.get(
-        "status",
-        "processing"
-    )
+    order_status = str(data.get("status", "processing") or "processing").lower()
+    delivery_code = str(data.get("delivery_code") or "")
+    if order_provider == "yupay":
+        if order_status in ("delivered", "success", "completed", "complete"):
+            if str(product_row["provider_group"] or "") == "gift_card" and not delivery_code:
+                order_status = "processing"
+            else:
+                order_status = "success"
+        else:
+            order_status = "processing"
+        c = conn()
+        try:
+            c.execute(
+                """INSERT INTO orders(bot_id,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,cost_usd,charged_usd,sale_price,status,created_at,updated_at,notified,provider,provider_order_id,service_type)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (int(context.bot.id or 0), uid, str(data.get("order_id") or merchant_order_id), int(game_id), int(paket_id),
+                 str(context.user_data.get("offer_name") or "Roblox"), player_id,
+                 json.dumps(fulfillment_data, ensure_ascii=False), float(product_row["price_usd"] or 0),
+                 float(product_row["price_usd"] or 0), float(price), order_status,
+                 datetime.now().isoformat(), datetime.now().isoformat(), "0", "yupay", merchant_order_id, str(product_row["provider_group"] or "robux"))
+            )
+            c.commit()
+        finally:
+            c.close()
 
     api_price = data.get(
         "price",
@@ -4476,16 +4876,27 @@ async def confirm(update, context):
             f"🌐 Server ID: {server_id}\n"
         )
 
-    await q.message.reply_text(
-        f"✅ Buyurtma yuborildi!\n\n"
-        f"📦 {context.user_data.get('offer_name','Paket')}\n"
-        f"🆔 {id_label}: {player_id}\n"
-        f"{user_extra}"
-        f"💰 {price:,.0f} so'm\n"
-        f"🔢 Buyurtma raqami: {playpay_id}\n"
-        f"📊 Status: {order_status}",
-        reply_markup=main_menu()
-    )
+    if order_provider == "yupay":
+        result_text = (
+            f"✅ Roblox buyurtmangiz qabul qilindi!\n\n📦 {context.user_data.get('offer_name','Paket')}\n"
+            f"💰 {price:,.0f} so'm\n🔢 Buyurtma raqami: {playpay_id}\n"
+        )
+        if delivery_code:
+            result_text += f"\n🎁 Gift Card kodi:\n<code>{html.escape(delivery_code)}</code>\n"
+        else:
+            result_text += "\n⏳ Yetkazish jarayonda. Tayyor bo'lganda bot xabar beradi.\n"
+        await q.message.reply_text(result_text, parse_mode="HTML", reply_markup=main_menu())
+    else:
+        await q.message.reply_text(
+            f"✅ Buyurtma yuborildi!\n\n"
+            f"📦 {context.user_data.get('offer_name','Paket')}\n"
+            f"🆔 {id_label}: {player_id}\n"
+            f"{user_extra}"
+            f"💰 {price:,.0f} so'm\n"
+            f"🔢 Buyurtma raqami: {playpay_id}\n"
+            f"📊 Status: {order_status}",
+            reply_markup=main_menu()
+        )
 
     # Har bir o'yin buyurtmasi kanalga ham yuboriladi.
     try:
@@ -4498,7 +4909,7 @@ async def confirm(update, context):
             f"🔗 Username: {_channel_username}\n🆔 Telegram ID: {uid}\n"
             f"🎮 Xizmat: {_game_title}\n"
             f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
-            f"🆔 O'yinchi ID: {player_id}\n"
+            + (f"🆔 O'yinchi ID: {player_id}\n" if order_provider != "yupay" else "📝 Roblox ma'lumotlari qabul qilindi\n")
             + (f"🌐 Server ID: {server_id}\n" if requires_server else "")
             + f"💰 Summa: {price:,.0f} so'm\n🔢 Buyurtma ID: {playpay_id or '-'}\n📊 Holat: {order_status}"
         )
@@ -4544,7 +4955,7 @@ async def confirm(update, context):
             f"🔗 Username: {tg_username}\n"
             f"🆔 Telegram ID: {uid}\n\n"
             f"🎮 O'yin: {game_name}\n"
-            f"🆔 O'yinchi ID: {player_id}\n"
+            + (f"🆔 O'yinchi ID: {player_id}\n" if order_provider != "yupay" else "📝 Roblox ma'lumotlari qabul qilindi\n")
             + (f"🌐 Server ID: {server_id}\n" if requires_server else "")
             + f"{package_icon} Paket: {package_name}\n"
             f"💰 Sotuv narxi: {price:,.0f} so'm\n"
@@ -5029,6 +5440,42 @@ async def text_handler(update, context):
             ]])
         )
         return
+
+    # ========================================================
+    # YUPAY ROBLOX: katalogdagi required_fields bo'yicha ma'lumot yig'ish
+    # ========================================================
+    if state == "yupay_field":
+        fields = context.user_data.get("yupay_required_fields") or []
+        index = int(context.user_data.get("yupay_field_index", 0) or 0)
+        if index >= len(fields):
+            context.user_data["state"] = None
+            return await confirm_order(update.message, context)
+        field = fields[index]
+        key = str(field.get("key") or "").strip()
+        if not key:
+            await update.message.reply_text("❌ Maydon nomi noto'g'ri. /cancel bosing va admin bilan bog'laning.")
+            context.user_data["state"] = None
+            return
+        if not text or len(text) > 200:
+            await update.message.reply_text("❌ Ma'lumot noto'g'ri. Qayta yuboring.")
+            return
+        pattern = str(field.get("pattern") or "").strip()
+        if pattern:
+            try:
+                if not re.fullmatch(pattern, text):
+                    await update.message.reply_text(f"❌ {_yupay_field_label(field)} formati noto'g'ri. Qayta yuboring.")
+                    return
+            except re.error:
+                log.error("YuPay required_fields regex noto'g'ri: %s", key)
+        context.user_data.setdefault("yupay_fulfillment_data", {})[key] = text
+        index += 1
+        context.user_data["yupay_field_index"] = index
+        if index < len(fields):
+            next_field = fields[index]
+            await update.message.reply_text(f"{_yupay_field_label(next_field)} ni yuboring:")
+            return
+        context.user_data["state"] = None
+        return await confirm_order(update.message, context)
 
     # ========================================================
     # PLAYER / USER ID
@@ -7016,6 +7463,35 @@ async def admin_media_handler(
         )
 
 
+def refund_yupay_once(provider_order_id, user_id, amount, note="YuPay order refund"):
+    """Provider order uchun mijoz balansini faqat bir marta qaytaradi."""
+    c = main_conn()
+    try:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO provider_refunds(provider_order_id,user_id,amount,created_at) VALUES(?,?,?,?)",
+            (str(provider_order_id), int(user_id), float(amount), datetime.now().isoformat())
+        )
+        inserted = int(getattr(cur, "rowcount", 0) or 0) > 0
+        if inserted:
+            c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (float(amount), int(user_id)))
+            c.execute(
+                "INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)",
+                (int(user_id), float(amount), "order_refund", str(note), datetime.now().isoformat())
+            )
+            result = True
+        else:
+            existing = c.execute("SELECT user_id FROM provider_refunds WHERE provider_order_id=?", (str(provider_order_id),)).fetchone()
+            result = bool(existing and int(existing["user_id"]) == int(user_id))
+        c.commit()
+        return result
+    except Exception:
+        c.rollback()
+        log.exception("YuPay qaytarimini yozishda xato: %s", provider_order_id)
+        return False
+    finally:
+        c.close()
+
+
 # ============================================================
 # ORDER STATUS
 # ============================================================
@@ -7032,7 +7508,7 @@ async def check_orders(context):
         WHERE LOWER(status) IN ('processing','pending','in_progress')
           AND COALESCE(NULLIF(provider_order_id,''), NULLIF(playpay_order_id,'')) IS NOT NULL
           AND COALESCE(NULLIF(provider_order_id,''), NULLIF(playpay_order_id,'')) != ''
-          AND COALESCE(provider,'bay2game') = 'bay2game'
+          AND COALESCE(provider,'bay2game') IN ('bay2game','yupay')
         ORDER BY id ASC
         LIMIT 30
         """
@@ -7043,6 +7519,46 @@ async def check_orders(context):
     for r in rows:
 
         try:
+            if str(r["provider"] or "bay2game") == "yupay":
+                status, data = await asyncio.to_thread(
+                    get_yupay_order,
+                    r["provider_order_id"] or r["playpay_order_id"]
+                )
+                if not data.get("ok"):
+                    continue
+                order = data.get("order", {})
+                raw_status = str(order.get("status", r["status"]) or r["status"]).lower()
+                new_status = "success" if raw_status == "delivered" and (str(r["service_type"] or "") != "gift_card" or bool(data.get("delivery_code"))) else "processing"
+                if raw_status == "failed":
+                    try:
+                        refunded = Decimal(str(order.get("refunded_usd") or "0"))
+                        charged = Decimal(str(order.get("price_usd") or "0"))
+                    except Exception:
+                        refunded, charged = Decimal("0"), Decimal("0")
+                    if charged > 0 and refunded >= charged:
+                        refund_ok = refund_yupay_once(
+                            r["provider_order_id"] or r["playpay_order_id"],
+                            int(r["user_id"]),
+                            Decimal(str(r["sale_price"] or 0)),
+                            f"Roblox buyurtma #{r['id']} to'liq qaytarildi"
+                        )
+                        new_status = "failed" if refund_ok else "processing"
+                    else:
+                        new_status = "processing"
+                old_status = str(r["status"] or "").lower()
+                if new_status != old_status:
+                    c = conn()
+                    c.execute("UPDATE orders SET status=?,updated_at=? WHERE id=?", (new_status, datetime.now().isoformat(), r["id"]))
+                    c.commit(); c.close()
+                    if new_status == "success":
+                        code = str(data.get("delivery_code") or "")
+                        msg = f"✅ Roblox buyurtma #{r['id']} yetkazildi."
+                        if code:
+                            msg += f"\n\n🎁 Gift Card kodi:\n<code>{html.escape(code)}</code>"
+                        await context.bot.send_message(r["user_id"], msg, parse_mode="HTML")
+                    elif new_status == "failed":
+                        await context.bot.send_message(r["user_id"], f"❌ Roblox buyurtma #{r['id']} bajarilmadi. To'lov balansingizga qaytarildi.")
+                continue
 
             status, data = await asyncio.to_thread(
                 get_playpay_order,
@@ -7211,7 +7727,7 @@ async def admin_callback(update, context):
 
     d = q.data
 
-    platform_only_callbacks = {"adm_bay2game_rate", "adm_playpay_balance", "a_sync"}
+    platform_only_callbacks = {"adm_bay2game_rate", "adm_playpay_balance", "a_sync", "a_yupay_roblox_sync"}
     if d in platform_only_callbacks and (is_child_bot(context) or q.from_user.id != ADMIN_ID):
         await q.answer("Xatolik", show_alert=True)
         return
@@ -7422,6 +7938,16 @@ async def admin_callback(update, context):
             reply_markup=admin_kb(context)
         )
 
+    elif d == "a_yupay_roblox_sync":
+        await q.message.reply_text("🎮 Roblox katalogi yangilanmoqda...")
+        ok, result = await asyncio.to_thread(sync_yupay_roblox_catalog)
+        if ok:
+            sync_all_child_catalogs()
+        await q.message.reply_text(
+            f"{'✅' if ok else '❌'} {result}",
+            reply_markup=admin_kb(context)
+        )
+
 
 # ============================================================
 # CALLBACK ROUTER
@@ -7458,6 +7984,9 @@ async def callback_router(update, context):
     if d == "transfer_confirm":
         return await transfer_confirm(update, context)
 
+
+    if d.startswith("rbcat:"):
+        return await roblox_category(update, context, d.split(":", 1)[1])
 
     # Telegram Stars / Premium — faqat ikkita aniq xizmat tanlovi.
     if d == "telegram_services":
@@ -7640,7 +8169,7 @@ async def callback_router(update, context):
         elif (
             d.startswith("adm_")
             or
-            d == "a_sync"
+            d in ("a_sync", "a_yupay_roblox_sync")
         ):
 
             await admin_callback(
@@ -7802,8 +8331,8 @@ def main():
     # Bay2Game katalogi admin panelidagi "Katalog" tugmasi orqali yangilanadi.
     c = conn()
     try:
-        c.execute("UPDATE products SET active=0 WHERE COALESCE(provider_product_code,'')=''")
-        c.execute("UPDATE games SET active=0 WHERE COALESCE(provider_game_code,'')=''")
+        c.execute("UPDATE products SET active=0 WHERE COALESCE(provider_product_code,'')='' AND COALESCE(provider,'bay2game')='bay2game'")
+        c.execute("UPDATE games SET active=0 WHERE COALESCE(provider_game_code,'')='' AND COALESCE(provider,'bay2game')='bay2game'")
         c.commit()
     finally:
         c.close()
