@@ -2777,8 +2777,8 @@ def sync_yupay_roblox_catalog():
             (ROBLOX_GAME_ID, "Roblox", "Roblox ID", 0, 0, 1, now, "roblox", "[]", "yupay")
         )
         # Eski provayderdan qolgan Roblox qatorlari ham foydalanuvchiga chiqmasin.
-        c.execute("UPDATE games SET active=0 WHERE LOWER(COALESCE(name,'')) LIKE '%roblox%' AND COALESCE(provider,'bay2game')!='yupay' AND game_id!=?", (ROBLOX_GAME_ID,))
-        c.execute("UPDATE products SET active=0 WHERE LOWER(COALESCE(game_name,'')) LIKE '%roblox%' AND COALESCE(provider,'bay2game')!='yupay'")
+        c.execute("UPDATE games SET active=0 WHERE LOWER(COALESCE(name,'')) LIKE '%%roblox%%' AND COALESCE(provider,'bay2game')!='yupay' AND game_id!=?", (ROBLOX_GAME_ID,))
+        c.execute("UPDATE products SET active=0 WHERE LOWER(COALESCE(game_name,'')) LIKE '%%roblox%%' AND COALESCE(provider,'bay2game')!='yupay'")
         c.execute("UPDATE products SET active=0 WHERE game_id=? AND provider='yupay'", (ROBLOX_GAME_ID,))
         for item in prepared:
             paket_id = bay2game_internal_id("yupay:" + item["sku_id"])
