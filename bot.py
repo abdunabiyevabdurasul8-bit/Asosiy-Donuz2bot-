@@ -982,6 +982,7 @@ def init_db():
         PAYMENT_CARD
     )
     set_default("donat_markup_percent", DEFAULT_MARKUP)
+    set_default("roblox_markup_percent", DEFAULT_MARKUP)
     set_default("bay2game_usd_uzs", os.getenv("BAY2GAME_USD_UZS", "13000"))
     set_default("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)
     set_default("stars_unit_price_uzs", "0")
@@ -2788,7 +2789,11 @@ def sync_yupay_roblox_catalog():
                     continue
                 fallback_rate = get_setting("bay2game_usd_uzs", YUPAY_USD_UZS)
                 api_uzs = usd * Decimal(str(get_setting("yupay_usd_uzs", fallback_rate) or fallback_rate))
-                sale_price = calc_sale_price(api_uzs)
+                try:
+                    roblox_markup = Decimal(str(get_setting("roblox_markup_percent", DEFAULT_MARKUP)))
+                except Exception:
+                    roblox_markup = DEFAULT_MARKUP
+                sale_price = (api_uzs * (Decimal("1") + roblox_markup / Decimal("100"))).quantize(Decimal("1"))
                 sku_name = str(sku.get("name") or sku.get("sku_code") or product.get("name") or sku_id)
                 product_name = str(product.get("name") or product.get("slug") or "Roblox")
                 prepared.append({
@@ -3685,6 +3690,7 @@ def admin_kb(context=None):
             InlineKeyboardButton("🎮 Donat ustama", callback_data="adm_markup_donat"),
             InlineKeyboardButton("📱 SIM ustama", callback_data="adm_markup_sim")
         ],
+        [InlineKeyboardButton("🎮 Roblox ustama (Robux + Gift Card)", callback_data="adm_markup_roblox")],
         [InlineKeyboardButton("🔗 Referal bonusini sozlash", callback_data="adm_referral_bonus")],
         [
             InlineKeyboardButton("⭐ 1 ta Stars narxi", callback_data="adm_markup_stars"),
@@ -6723,6 +6729,7 @@ async def admin_markup_start(update, context, kind):
         "sim": ("📱 SIM", "sim_markup_percent", SIM_MARKUP_PERCENT),
         "stars": ("⭐ Stars", "stars_markup_percent", TELEGRAM_MARKUP_PERCENT),
         "premium": ("💎 Premium", "premium_markup_percent", TELEGRAM_MARKUP_PERCENT),
+        "roblox": ("🎮 Roblox (Robux + Gift Card)", "roblox_markup_percent", DEFAULT_MARKUP),
     }
     label, key, default = labels[kind]
     try:
@@ -6918,7 +6925,7 @@ async def admin_text_handler(update, context):
     # ========================================================
     # ALOHIDA USTAMALAR
     # ========================================================
-    if state in ("markup_donat", "markup_sim", "markup_stars", "markup_premium"):
+    if state in ("markup_donat", "markup_sim", "markup_stars", "markup_premium", "markup_roblox"):
         try:
             percent = Decimal(text.replace(",", ".").replace("%", "").strip())
         except Exception:
@@ -6928,9 +6935,25 @@ async def admin_text_handler(update, context):
             await update.message.reply_text("❌ Foiz 0 dan 1000 gacha bo'lishi kerak.")
             return True
         kind = state.replace("markup_", "")
-        keys = {"donat":"donat_markup_percent", "sim":"sim_markup_percent", "stars":"stars_markup_percent", "premium":"premium_markup_percent"}
-        labels = {"donat":"🎮 Donat", "sim":"📱 SIM / Virtual raqam", "stars":"⭐ Stars", "premium":"💎 Premium"}
+        keys = {"donat":"donat_markup_percent", "sim":"sim_markup_percent", "stars":"stars_markup_percent", "premium":"premium_markup_percent", "roblox":"roblox_markup_percent"}
+        labels = {"donat":"🎮 Donat", "sim":"📱 SIM / Virtual raqam", "stars":"⭐ Stars", "premium":"💎 Premium", "roblox":"🎮 Roblox (Robux + Gift Card)"}
         set_setting(keys[kind], str(percent))
+        if kind == "roblox":
+            # Saqlangan Roblox Robux va Gift Card narxlarini ham darhol qayta hisoblaymiz.
+            c = conn()
+            rows = c.execute(
+                "SELECT paket_id, api_price_uzs FROM products WHERE game_id=? AND provider='yupay'",
+                (ROBLOX_GAME_ID,)
+            ).fetchall()
+            for row in rows:
+                base = Decimal(str(row["api_price_uzs"] or 0))
+                new_price = (base * (Decimal("1") + percent / Decimal("100"))).quantize(Decimal("1"))
+                c.execute(
+                    "UPDATE products SET sale_price=? WHERE game_id=? AND paket_id=? AND provider='yupay'",
+                    (float(new_price), ROBLOX_GAME_ID, row["paket_id"])
+                )
+            c.commit()
+            c.close()
         context.user_data.clear()
         await update.message.reply_text(
             f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%\n\n"
@@ -7915,6 +7938,9 @@ async def admin_callback(update, context):
 
     elif d == "adm_markup_sim":
         await admin_markup_start(update, context, "sim")
+
+    elif d == "adm_markup_roblox":
+        await admin_markup_start(update, context, "roblox")
 
     elif d == "adm_stars_unit_price":
         if q.from_user.id != bot_admin_id(context):
