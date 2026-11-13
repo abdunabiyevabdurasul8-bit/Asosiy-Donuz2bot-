@@ -1099,6 +1099,19 @@ def ensure_external_schema():
             if name not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {typ}")
 
+        # Eski Supabase bazalarida orders.bot_id UUID bo'lib qolgan bo'lishi mumkin.
+        # Joriy kod esa Telegram bot ID raqamini yozadi. UUID qiymatlarni yo'qotmaslik
+        # uchun ustunni TEXT ga o'tkazamiz: eski UUID lar ham, yangi raqamli ID lar ham saqlanadi.
+        if isinstance(c, PGConnection):
+            bot_id_type = c.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='orders' AND column_name='bot_id'"
+            ).fetchone()
+            if bot_id_type and str(bot_id_type["data_type"]).lower() != "text":
+                c.execute("ALTER TABLE orders ALTER COLUMN bot_id DROP DEFAULT")
+                c.execute("ALTER TABLE orders ALTER COLUMN bot_id TYPE TEXT USING bot_id::text")
+                c.execute("ALTER TABLE orders ALTER COLUMN bot_id SET DEFAULT '0'")
+
         # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
         for table, cols in {
             "games": {
@@ -4910,7 +4923,7 @@ async def confirm(update, context):
             c.execute(
                 """INSERT INTO orders(bot_id,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,cost_usd,charged_usd,sale_price,status,created_at,updated_at,notified,provider,provider_order_id,service_type)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (int(context.bot.id or 0), uid, str(data.get("order_id") or merchant_order_id), int(game_id), int(paket_id),
+                (str(int(context.bot.id or 0)), uid, str(data.get("order_id") or merchant_order_id), int(game_id), int(paket_id),
                  str(context.user_data.get("offer_name") or "Roblox"), player_id,
                  json.dumps(fulfillment_data, ensure_ascii=False), float(product_row["price_usd"] or 0),
                  float(product_row["price_usd"] or 0), float(price), order_status,
