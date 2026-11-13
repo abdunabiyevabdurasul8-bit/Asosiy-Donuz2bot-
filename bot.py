@@ -2872,7 +2872,7 @@ def _yupay_unwrap_order(payload):
 
 
 def _yupay_code_text(value):
-    """Voucher kodini string, list yoki code obyektlaridan xavfsiz ajratadi."""
+    """YuPay voucher javobidan kod(lar)ni keng tarqalgan ichma-ich shakllarda oladi."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -2883,38 +2883,43 @@ def _yupay_code_text(value):
         parts = [_yupay_code_text(item) for item in value]
         return "\n".join(part for part in parts if part)
     if isinstance(value, dict):
-        for key in ("code", "voucher_code", "redeem_code", "pin", "serial"):
+        # Avval faqat kod ekanini bildiruvchi maydonlarni qidiramiz.
+        for key in ("code", "codes", "voucher_code", "voucher_codes", "redeem_code", "redeem_codes", "pin", "serial"):
             found = _yupay_code_text(value.get(key))
             if found:
                 return found
-        return ""
+        # YuPay turli versiyalarida artifact/payload/result ichma-ich kelishi mumkin.
+        for key in ("artifact", "payload", "result", "data", "details", "items"):
+            child = value.get(key)
+            if isinstance(child, (dict, list)):
+                found = _yupay_code_text(child)
+                if found:
+                    return found
     return ""
 
 
 def _yupay_delivery_details(order):
-    """Merchant API dagi delivery.artifact.code yoki delivery.artifact.codes ni oladi."""
+    """YuPay Merchant API javobining turli delivery/artifact shakllaridan kodni oladi."""
     order = order if isinstance(order, dict) else {}
     delivery = order.get("delivery") if isinstance(order.get("delivery"), dict) else {}
-    artifact = delivery.get("artifact")
-    code = ""
-    if isinstance(artifact, dict):
-        code = _yupay_code_text(artifact.get("code"))
-        if not code:
-            code = _yupay_code_text(artifact.get("codes"))
-        if not code:
-            # Ayrim voucher turlarida kod maydoni boshqa nom bilan kelishi mumkin.
-            for key in ("voucher_code", "redeem_code", "pin", "serial"):
-                code = _yupay_code_text(artifact.get(key))
-                if code:
-                    break
-    elif isinstance(artifact, (str, list)):
-        code = _yupay_code_text(artifact)
+    code = _yupay_code_text(delivery)
     if not code:
-        code = _yupay_code_text(delivery.get("code") or delivery.get("codes"))
+        code = _yupay_code_text(order.get("delivery_code") or order.get("delivery_codes"))
     if not code:
-        code = _yupay_code_text(order.get("delivery_code"))
-    artifact_kind = str(delivery.get("artifact_kind") or order.get("artifact_kind") or "").lower()
+        # Ba'zi javoblarda delivery alohida emas, order ichidagi artifact/data da bo'ladi.
+        code = _yupay_code_text(order.get("artifact"))
+    artifact = delivery.get("artifact") if isinstance(delivery.get("artifact"), dict) else {}
+    artifact_kind = str(
+        delivery.get("artifact_kind") or artifact.get("kind") or artifact.get("type")
+        or order.get("artifact_kind") or order.get("delivery_type") or ""
+    ).lower()
     return code, artifact_kind
+
+
+def _yupay_is_delivered(status):
+    return str(status or "").strip().lower() in {
+        "delivered", "success", "successful", "completed", "complete", "fulfilled", "finished"
+    }
 
 
 def get_yupay_order(merchant_order_id):
@@ -5095,11 +5100,11 @@ async def confirm(update, context):
             f"✅ Roblox buyurtmangiz qabul qilindi!\n\n📦 {context.user_data.get('offer_name','Paket')}\n"
             f"💰 {price:,.0f} so'm\n🔢 Buyurtma raqami: {playpay_id}\n"
         )
-        if delivery_code:
+        if delivery_code and order_status == "success":
             code_label = "🎮 Robux kodi" if str(product_row["provider_group"] or "") == "robux" else "🎁 Gift Card kodi"
             result_text += f"\n{code_label}:\n<code>{html.escape(delivery_code)}</code>\n"
         else:
-            result_text += "\n⏳ Yetkazish jarayonda. Tayyor bo'lganda bot xabar beradi.\n"
+            result_text += "\n⏳ Yetkazish jarayonda. Kod tayyor bo'lganda bot xabar beradi.\n"
         await q.message.reply_text(result_text, parse_mode="HTML", reply_markup=main_menu())
     else:
         await q.message.reply_text(
@@ -7763,7 +7768,7 @@ async def check_orders(context):
                 delivery_code = str(data.get("delivery_code") or "")
                 artifact_kind = str(data.get("artifact_kind") or "").lower()
                 needs_code = (str(r["service_type"] or "") in ("robux", "gift_card") or artifact_kind == "voucher_code")
-                new_status = "success" if raw_status == "delivered" and (not needs_code or bool(delivery_code)) else "processing"
+                new_status = "success" if _yupay_is_delivered(raw_status) and (not needs_code or bool(delivery_code)) else "processing"
                 if raw_status == "failed":
                     try:
                         refunded = Decimal(str(order.get("refunded_usd") or "0"))
