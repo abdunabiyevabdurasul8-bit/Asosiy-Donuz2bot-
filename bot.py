@@ -1073,7 +1073,10 @@ def ensure_external_schema():
         additions = {
             # Older PostgreSQL databases may have an orders table created by a previous version.
             # Add every column used by current order flows before handlers start.
-            "bot_id": "BIGINT NOT NULL DEFAULT 0",
+            # PostgreSQL orders.bot_id references bots.id (UUID); Telegram numeric ID
+            # is stored separately in telegram_bot_id. SQLite child DBs use BIGINT.
+            "bot_id": ("UUID" if isinstance(c, PGConnection) else "BIGINT NOT NULL DEFAULT 0"),
+            "telegram_bot_id": "BIGINT DEFAULT 0",
             "user_id": "BIGINT",
             "playpay_order_id": "TEXT DEFAULT ''",
             "game_id": "BIGINT DEFAULT 0",
@@ -1099,18 +1102,11 @@ def ensure_external_schema():
             if name not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {typ}")
 
-        # Eski Supabase bazalarida orders.bot_id UUID bo'lib qolgan bo'lishi mumkin.
-        # Joriy kod esa Telegram bot ID raqamini yozadi. UUID qiymatlarni yo'qotmaslik
-        # uchun ustunni TEXT ga o'tkazamiz: eski UUID lar ham, yangi raqamli ID lar ham saqlanadi.
+        # orders.bot_id UUID FK bo'lib qoladi. Telegram botning raqamli IDsi
+        # telegram_bot_id ustunida saqlanadi. FK ni buzib, UUID ustunini TEXT ga
+        # o'tkazmaymiz. Agar bot mosligi topilmasa, NULL ruxsat beriladi.
         if isinstance(c, PGConnection):
-            bot_id_type = c.execute(
-                "SELECT data_type FROM information_schema.columns "
-                "WHERE table_schema='public' AND table_name='orders' AND column_name='bot_id'"
-            ).fetchone()
-            if bot_id_type and str(bot_id_type["data_type"]).lower() != "text":
-                c.execute("ALTER TABLE orders ALTER COLUMN bot_id DROP DEFAULT")
-                c.execute("ALTER TABLE orders ALTER COLUMN bot_id TYPE TEXT USING bot_id::text")
-                c.execute("ALTER TABLE orders ALTER COLUMN bot_id SET DEFAULT '0'")
+            c.execute("ALTER TABLE orders ALTER COLUMN bot_id DROP NOT NULL")
 
         # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
         for table, cols in {
@@ -4625,6 +4621,54 @@ async def offer(update, context):
     )
 
 
+def resolve_orders_bot_uuid(c, telegram_bot_id, bot_username=""):
+    """PostgreSQL orders.bot_id uchun bots.id UUID ni topadi.
+
+    Telegram bot ID raqamli bo'lgani uchun uni UUID FK ustuniga bevosita yozib bo'lmaydi.
+    Bots jadvalidagi mos Telegram ID/username orqali UUID olinadi.
+    """
+    if not isinstance(c, PGConnection):
+        return int(telegram_bot_id or 0)
+    try:
+        cols = c.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='bots'"
+        ).fetchall()
+        available = {str(row["column_name"]): str(row["data_type"]).lower() for row in cols}
+        candidates = (
+            ("telegram_bot_id", str(int(telegram_bot_id or 0))),
+            ("telegram_id", str(int(telegram_bot_id or 0))),
+            ("tg_bot_id", str(int(telegram_bot_id or 0))),
+            ("bot_telegram_id", str(int(telegram_bot_id or 0))),
+            ("bot_id", str(int(telegram_bot_id or 0))),
+            ("username", str(bot_username or "").lstrip("@")),
+            ("bot_username", str(bot_username or "").lstrip("@")),
+            ("telegram_username", str(bot_username or "").lstrip("@")),
+        )
+        for column, value in candidates:
+            dtype = available.get(column)
+            if not dtype or not value or value == "0":
+                continue
+            if column in ("username", "bot_username", "telegram_username"):
+                if dtype not in ("text", "character varying", "character"):
+                    continue
+            elif dtype not in ("smallint", "integer", "bigint", "numeric", "text", "character varying", "character"):
+                continue
+            row = c.execute(
+                f'SELECT id::text AS id FROM bots WHERE "{column}"::text=? LIMIT 1',
+                (value,),
+            ).fetchone()
+            if row and row["id"]:
+                return str(row["id"])
+    except Exception as exc:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        log.warning("orders.bot_id uchun bots.id UUID topilmadi: %s", exc)
+    return None
+
+
 # ============================================================
 # CONFIRM ORDER
 # ============================================================
@@ -4981,9 +5025,10 @@ async def confirm(update, context):
         c = conn()
         try:
             c.execute(
-                """INSERT INTO orders(bot_id,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,cost_usd,charged_usd,sale_price,status,created_at,updated_at,notified,provider,provider_order_id,service_type)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (str(int(context.bot.id or 0)), uid, str(data.get("order_id") or merchant_order_id), int(game_id), int(paket_id),
+                """INSERT INTO orders(bot_id,telegram_bot_id,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,cost_usd,charged_usd,sale_price,status,created_at,updated_at,notified,provider,provider_order_id,service_type)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (resolve_orders_bot_uuid(c, context.bot.id, getattr(context.bot, "username", "")), int(context.bot.id or 0), uid,
+                 str(data.get("order_id") or merchant_order_id), int(game_id), int(paket_id),
                  str(context.user_data.get("offer_name") or "Roblox"), player_id,
                  json.dumps(fulfillment_data, ensure_ascii=False), float(product_row["price_usd"] or 0),
                  float(product_row["price_usd"] or 0), float(price), order_status,
