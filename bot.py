@@ -1077,6 +1077,7 @@ def ensure_external_schema():
             # is stored separately in telegram_bot_id. SQLite child DBs use BIGINT.
             "bot_id": ("UUID" if isinstance(c, PGConnection) else "BIGINT NOT NULL DEFAULT 0"),
             "telegram_bot_id": "BIGINT DEFAULT 0",
+            "service_code": "TEXT DEFAULT ''",
             "user_id": "BIGINT",
             "playpay_order_id": "TEXT DEFAULT ''",
             "game_id": "BIGINT DEFAULT 0",
@@ -5030,10 +5031,10 @@ async def confirm(update, context):
         c = conn()
         try:
             c.execute(
-                """INSERT INTO orders(bot_id,telegram_bot_id,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,cost_usd,charged_usd,sale_price,status,created_at,updated_at,notified,provider,provider_order_id,service_type)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (resolve_orders_bot_uuid(c, context.bot.id, getattr(context.bot, "username", "")), int(context.bot.id or 0), uid,
-                 str(data.get("order_id") or merchant_order_id), int(game_id), int(paket_id),
+                """INSERT INTO orders(bot_id,telegram_bot_id,service_code,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,cost_usd,charged_usd,sale_price,status,created_at,updated_at,notified,provider,provider_order_id,service_type)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (resolve_orders_bot_uuid(c, context.bot.id, getattr(context.bot, "username", "")), int(context.bot.id or 0),
+                 "roblox", uid, str(data.get("order_id") or merchant_order_id), int(game_id), int(paket_id),
                  str(context.user_data.get("offer_name") or "Roblox"), player_id,
                  json.dumps(fulfillment_data, ensure_ascii=False), float(product_row["price_usd"] or 0),
                  float(product_row["price_usd"] or 0), float(price), order_status,
