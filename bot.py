@@ -3248,8 +3248,19 @@ def telegram_stars_amount(product_code="", package_name=""):
 
 
 def sync_catalog():
-    """Bay2Game categories va products katalogini yangilaydi."""
+    """Bay2Game categories va products katalogini yangilaydi.
+
+    /categories kaliti yaroqsiz yoki API javobi bo'sh bo'lsa, qo'shimcha
+    qidiruv so'rovlarini yubormaymiz. Bu timeoutlar yig'ilib ketishini
+    oldini oladi va avval saqlangan katalogni o'chirmaydi.
+    """
     categories = get_games_api() or []
+    if not categories:
+        return False, (
+            "⚠️ Bay2Game katalogi olinmadi. API javobida o'yinlar yo'q yoki "
+            "API kaliti yaroqsiz (invalid api key). Avval Render Environment "
+            "ichidagi BAY2GAME_API_KEY qiymatini tekshiring. Saqlangan katalog o'zgartirilmadi."
+        )
 
     game_count = 0
     product_count = 0
