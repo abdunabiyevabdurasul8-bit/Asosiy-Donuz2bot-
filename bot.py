@@ -1073,11 +1073,7 @@ def ensure_external_schema():
         additions = {
             # Older PostgreSQL databases may have an orders table created by a previous version.
             # Add every column used by current order flows before handlers start.
-            # PostgreSQL orders.bot_id references bots.id (UUID); Telegram numeric ID
-            # is stored separately in telegram_bot_id. SQLite child DBs use BIGINT.
-            "bot_id": ("UUID" if isinstance(c, PGConnection) else "BIGINT NOT NULL DEFAULT 0"),
-            "telegram_bot_id": "BIGINT DEFAULT 0",
-            "service_code": "TEXT DEFAULT ''",
+            "bot_id": "BIGINT NOT NULL DEFAULT 0",
             "user_id": "BIGINT",
             "playpay_order_id": "TEXT DEFAULT ''",
             "game_id": "BIGINT DEFAULT 0",
@@ -1102,12 +1098,6 @@ def ensure_external_schema():
         for name, typ in additions.items():
             if name not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {typ}")
-
-        # orders.bot_id UUID FK bo'lib qoladi. Telegram botning raqamli IDsi
-        # telegram_bot_id ustunida saqlanadi. FK ni buzib, UUID ustunini TEXT ga
-        # o'tkazmaymiz. Agar bot mosligi topilmasa, NULL ruxsat beriladi.
-        if isinstance(c, PGConnection):
-            c.execute("ALTER TABLE orders ALTER COLUMN bot_id DROP NOT NULL")
 
         # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
         for table, cols in {
@@ -2401,6 +2391,7 @@ def get_packages_api(game_id):
         log.warning("Bay2Game products javob formatini aniqlab bo'lmadi: keys=%s", list(data.keys()))
         return None
 
+    usd_rate = get_bay2game_usd_uzs()
     packages = []
     seen_codes = set()
     for product in products:
@@ -2441,7 +2432,7 @@ def get_packages_api(game_id):
             ),
             "price": {
                 "usd": str(usd),
-                "amount": str(usd * get_bay2game_usd_uzs()),
+                "amount": str(usd * usd_rate),
             },
             "sell_price": str(usd),
             "status": product.get("status", "active"),
@@ -2861,81 +2852,22 @@ def sync_yupay_roblox_catalog():
     return True, f"Roblox katalogi yangilandi: {counts['robux']} ta Robux, {counts['gift_card']} ta Gift Card paketi."
 
 
-def _yupay_unwrap_order(payload):
-    """YuPay javobining order/data ichma-ich ko'rinishlarini bir xil shaklga keltiradi."""
-    root = payload if isinstance(payload, dict) else {}
-    nested = root.get("data") if isinstance(root.get("data"), dict) else root
-    if isinstance(nested.get("order"), dict):
-        return nested["order"]
-    if isinstance(root.get("order"), dict):
-        return root["order"]
-    return nested
-
-
-def _yupay_code_text(value):
-    """YuPay voucher javobidan kod(lar)ni keng tarqalgan ichma-ich shakllarda oladi."""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, list):
-        parts = [_yupay_code_text(item) for item in value]
-        return "\n".join(part for part in parts if part)
-    if isinstance(value, dict):
-        # Avval faqat kod ekanini bildiruvchi maydonlarni qidiramiz.
-        for key in ("code", "codes", "voucher_code", "voucher_codes", "redeem_code", "redeem_codes", "pin", "serial"):
-            found = _yupay_code_text(value.get(key))
-            if found:
-                return found
-        # YuPay turli versiyalarida artifact/payload/result ichma-ich kelishi mumkin.
-        for key in ("artifact", "payload", "result", "data", "details", "items"):
-            child = value.get(key)
-            if isinstance(child, (dict, list)):
-                found = _yupay_code_text(child)
-                if found:
-                    return found
-    return ""
-
-
-def _yupay_delivery_details(order):
-    """YuPay Merchant API javobining turli delivery/artifact shakllaridan kodni oladi."""
-    order = order if isinstance(order, dict) else {}
-    delivery = order.get("delivery") if isinstance(order.get("delivery"), dict) else {}
-    code = _yupay_code_text(delivery)
-    if not code:
-        code = _yupay_code_text(order.get("delivery_code") or order.get("delivery_codes"))
-    if not code:
-        # Ba'zi javoblarda delivery alohida emas, order ichidagi artifact/data da bo'ladi.
-        code = _yupay_code_text(order.get("artifact"))
-    artifact = delivery.get("artifact") if isinstance(delivery.get("artifact"), dict) else {}
-    artifact_kind = str(
-        delivery.get("artifact_kind") or artifact.get("kind") or artifact.get("type")
-        or order.get("artifact_kind") or order.get("delivery_type") or ""
-    ).lower()
-    return code, artifact_kind
-
-
-def _yupay_is_delivered(status):
-    return str(status or "").strip().lower() in {
-        "delivered", "success", "successful", "completed", "complete", "fulfilled", "finished"
-    }
-
-
 def get_yupay_order(merchant_order_id):
     from urllib.parse import quote
     status, data = yupay_request("GET", "/orders/" + quote(str(merchant_order_id), safe=""))
     if not data.get("ok"):
         return status, data
-    order = _yupay_unwrap_order(data)
-    code, artifact_kind = _yupay_delivery_details(order)
+    order = data.get("order") if isinstance(data.get("order"), dict) else data
+    delivery = order.get("delivery") if isinstance(order.get("delivery"), dict) else {}
+    artifact = delivery.get("artifact") if isinstance(delivery.get("artifact"), dict) else {}
+    code = artifact.get("code")
+    if not code and isinstance(artifact.get("codes"), list):
+        code = "\n".join(str(x) for x in artifact["codes"])
     return status, {
         "ok": True,
         "order": order,
         "status": str(order.get("status") or "paid").lower(),
-        "delivery_code": code,
-        "artifact_kind": artifact_kind,
+        "delivery_code": str(code or ""),
         "failure_reason": str(order.get("failure_reason") or ""),
         "refunded_usd": str(order.get("refunded_usd") or "0"),
         "price_usd": str(order.get("price_usd") or "0"),
@@ -2969,15 +2901,11 @@ def yupay_place_order(sku_id, expected_price, fulfillment_data, merchant_order_i
     if check.get("ok"):
         return check_status, check
     # POST muvaffaqiyatli bo'ldi: status endpoint vaqtincha ishlamasa ham pulni qaytarmaymiz.
-    nested = _yupay_unwrap_order(created)
-    code, artifact_kind = _yupay_delivery_details(nested)
+    nested = created.get("order") if isinstance(created.get("order"), dict) else created
     return status, {
         "ok": True, "order_id": str(nested.get("order_id") or merchant_order_id),
         "status": str(nested.get("status") or "paid").lower(),
-        "delivery_code": code, "artifact_kind": artifact_kind,
-        "failure_reason": str(nested.get("failure_reason") or ""),
-        "refunded_usd": str(nested.get("refunded_usd") or "0"),
-        "price_usd": str(nested.get("price_usd") or expected_price),
+        "delivery_code": "", "failure_reason": "", "refunded_usd": "0", "price_usd": str(expected_price),
     }
 
 
@@ -2997,7 +2925,7 @@ def _yupay_field_label(field):
 # NARX
 # ============================================================
 
-def calc_sale_price(api_uzs):
+def calc_sale_price(api_uzs, markup=None):
 
     try:
 
@@ -3009,10 +2937,13 @@ def calc_sale_price(api_uzs):
 
         price = Decimal("0")
 
-    try:
-        markup = Decimal(str(get_setting("donat_markup_percent", DEFAULT_MARKUP)))
-    except Exception:
-        markup = DEFAULT_MARKUP
+    if markup is None:
+        try:
+            markup = Decimal(str(get_setting("donat_markup_percent", DEFAULT_MARKUP)))
+        except Exception:
+            markup = DEFAULT_MARKUP
+    else:
+        markup = Decimal(str(markup))
 
     sale = price * (
         Decimal("1")
@@ -3023,6 +2954,54 @@ def calc_sale_price(api_uzs):
     return sale.quantize(
         Decimal("1")
     )
+
+
+def recalc_product_prices():
+    """Saqlangan ustama foizlarini bazadagi barcha paketlarning sotuv narxiga darhol qo'llaydi."""
+    def pct(key, default):
+        try:
+            return Decimal(str(get_setting(key, default)))
+        except Exception:
+            return Decimal(str(default))
+    donat = pct("donat_markup_percent", DEFAULT_MARKUP)
+    roblox = pct("roblox_markup_percent", DEFAULT_MARKUP)
+    premium = pct("premium_markup_percent", TELEGRAM_MARKUP_PERCENT)
+    stars = pct("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)
+    try:
+        unit = Decimal(str(get_setting("stars_unit_price_uzs", "0") or "0"))
+    except Exception:
+        unit = Decimal("0")
+    updated = 0
+    c = main_conn()
+    try:
+        rows = c.execute(
+            "SELECT game_id,paket_id,game_name,package_name,api_price_uzs,sale_price,"
+            "COALESCE(provider,'bay2game') AS provider,COALESCE(provider_product_code,'') AS pcode FROM products"
+        ).fetchall()
+        for r in rows:
+            base = Decimal(str(r["api_price_uzs"] or 0))
+            words = (str(r["game_name"] or "") + " " + str(r["package_name"] or "")).lower()
+            if int(r["game_id"]) == ROBLOX_GAME_ID or r["provider"] == "yupay":
+                new = base * (Decimal("1") + roblox / Decimal("100"))
+            elif "premium" in words:
+                new = base * (Decimal("1") + premium / Decimal("100"))
+            elif "star" in words:
+                amount = telegram_stars_amount(r["pcode"], r["package_name"])
+                if unit > 0 and amount > 0:
+                    new = unit * amount
+                else:
+                    new = base * (Decimal("1") + stars / Decimal("100"))
+            else:
+                new = base * (Decimal("1") + donat / Decimal("100"))
+            new = new.quantize(Decimal("1"))
+            if abs(float(new) - float(r["sale_price"] or 0)) >= 0.5:
+                c.execute("UPDATE products SET sale_price=? WHERE game_id=? AND paket_id=?",
+                          (float(new), r["game_id"], r["paket_id"]))
+                updated += 1
+        c.commit()
+    finally:
+        c.close()
+    return updated
 
 
 # ============================================================
@@ -3264,6 +3243,21 @@ def sync_catalog():
     """Bay2Game categories va products katalogini yangilaydi."""
     categories = get_games_api() or []
 
+    # Sozlamalar bir marta o'qiladi (avval har paketda bazaga qayta ulanilardi — juda sekin edi).
+    usd_rate = get_bay2game_usd_uzs()
+    def _pct(key, default):
+        try:
+            return Decimal(str(get_setting(key, default)))
+        except Exception:
+            return Decimal(str(default))
+    donat_pct = _pct("donat_markup_percent", DEFAULT_MARKUP)
+    premium_pct = _pct("premium_markup_percent", TELEGRAM_MARKUP_PERCENT)
+    stars_pct = _pct("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)
+    try:
+        stars_unit_price = Decimal(str(get_setting("stars_unit_price_uzs", "0") or "0"))
+    except Exception:
+        stars_unit_price = Decimal("0")
+
     game_count = 0
     product_count = 0
     # Katalogni yangilash mavjud o'yinlarni o'chirib qo'ymasligi kerak.
@@ -3363,49 +3357,51 @@ def sync_catalog():
         data = get_packages_api(gid)
         if not data:
             continue
-        for product in data.get("packages", []):
-            try:
-                product_code = str(product.get("product_code") or "").strip()
-                if not product_code:
-                    continue
-                paket_id = bay2game_internal_id(product_code)
-                usd = Decimal(str(product.get("sell_price", product.get("price", {}).get("usd", 0)) or 0))
-                api_uzs = usd * get_bay2game_usd_uzs()
-                package_name = str(product.get("name") or product.get("product_name") or product_code)
-                service_words = (str(name) + " " + package_name).lower()
-                if "premium" in service_words:
-                    try:
-                        markup = Decimal(str(get_setting("premium_markup_percent", TELEGRAM_MARKUP_PERCENT)))
-                    except Exception:
-                        markup = TELEGRAM_MARKUP_PERCENT
-                    sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
-                elif "star" in service_words:
-                    unit_price = Decimal(str(get_setting("stars_unit_price_uzs", "0") or "0"))
-                    stars_amount = telegram_stars_amount(product_code, package_name)
-                    if unit_price > 0 and stars_amount > 0:
-                        sale_price = (unit_price * stars_amount).quantize(Decimal("1"))
+        pc = None
+        try:
+            pc = conn()
+            for product in data.get("packages", []):
+                try:
+                    product_code = str(product.get("product_code") or "").strip()
+                    if not product_code:
+                        continue
+                    paket_id = bay2game_internal_id(product_code)
+                    usd = Decimal(str(product.get("sell_price", product.get("price", {}).get("usd", 0)) or 0))
+                    api_uzs = usd * usd_rate
+                    package_name = str(product.get("name") or product.get("product_name") or product_code)
+                    service_words = (str(name) + " " + package_name).lower()
+                    if "premium" in service_words:
+                        sale_price = (api_uzs * (Decimal("1") + premium_pct / Decimal("100"))).quantize(Decimal("1"))
+                    elif "star" in service_words:
+                        stars_amount = telegram_stars_amount(product_code, package_name)
+                        if stars_unit_price > 0 and stars_amount > 0:
+                            sale_price = (stars_unit_price * stars_amount).quantize(Decimal("1"))
+                        else:
+                            sale_price = (api_uzs * (Decimal("1") + stars_pct / Decimal("100"))).quantize(Decimal("1"))
                     else:
-                        try:
-                            markup = Decimal(str(get_setting("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)))
-                        except Exception:
-                            markup = TELEGRAM_MARKUP_PERCENT
-                        sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
-                else:
-                    sale_price = calc_sale_price(api_uzs)
-                product_status = str(product.get("status", "active")).lower()
-                active = 0 if product_status in ("inactive", "disabled", "unavailable", "out_of_stock") else 1
-                c = conn()
-                c.execute(
-                    "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (gid, paket_id, name, package_name, float(usd), float(api_uzs), float(sale_price), active, datetime.now().isoformat(), product_code),
-                )
-                c.commit()
-                c.close()
-                product_count += 1
+                        sale_price = calc_sale_price(api_uzs, donat_pct)
+                    product_status = str(product.get("status", "active")).lower()
+                    active = 0 if product_status in ("inactive", "disabled", "unavailable", "out_of_stock") else 1
+                    pc.execute(
+                        "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (gid, paket_id, name, package_name, float(usd), float(api_uzs), float(sale_price), active, datetime.now().isoformat(), product_code),
+                    )
+                    pc.commit()
+                    product_count += 1
+                except Exception:
+                    log.exception("Bay2Game product saqlash xatosi game=%s", game_code)
+                    try:
+                        pc.rollback()
+                    except Exception:
+                        pass
+        except Exception:
+            log.exception("Bay2Game mahsulotlar ulanish xatosi game=%s", game_code)
+        finally:
+            try:
+                if pc is not None:
+                    pc.close()
             except Exception:
-                log.exception("Bay2Game product saqlash xatosi game=%s", game_code)
-                try: c.close()
-                except Exception: pass
+                pass
 
     # Mobile Legends Global — foydalanuvchi taqdim etgan Bay2Game SKU ro'yxati.
     # Buyurtma endpointi product_code bilan ishlaydi; game_code taxmin qilinmaydi.
@@ -3443,11 +3439,10 @@ def sync_catalog():
              datetime.now().isoformat(), "mlbb_global", json.dumps(["user_id", "server_id"]))
         )
         game_count += 1
-        usd_rate = get_bay2game_usd_uzs()
         for product_code, title, reseller_usd in global_products:
             usd = Decimal(reseller_usd)
             api_uzs = usd * usd_rate
-            sale_price = calc_sale_price(api_uzs)
+            sale_price = calc_sale_price(api_uzs, donat_pct)
             c.execute(
                 "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (MOBILE_LEGENDS_GLOBAL_GAME_ID, bay2game_internal_id(product_code),
@@ -4627,54 +4622,6 @@ async def offer(update, context):
     )
 
 
-def resolve_orders_bot_uuid(c, telegram_bot_id, bot_username=""):
-    """PostgreSQL orders.bot_id uchun bots.id UUID ni topadi.
-
-    Telegram bot ID raqamli bo'lgani uchun uni UUID FK ustuniga bevosita yozib bo'lmaydi.
-    Bots jadvalidagi mos Telegram ID/username orqali UUID olinadi.
-    """
-    if not isinstance(c, PGConnection):
-        return int(telegram_bot_id or 0)
-    try:
-        cols = c.execute(
-            "SELECT column_name, data_type FROM information_schema.columns "
-            "WHERE table_schema='public' AND table_name='bots'"
-        ).fetchall()
-        available = {str(row["column_name"]): str(row["data_type"]).lower() for row in cols}
-        candidates = (
-            ("telegram_bot_id", str(int(telegram_bot_id or 0))),
-            ("telegram_id", str(int(telegram_bot_id or 0))),
-            ("tg_bot_id", str(int(telegram_bot_id or 0))),
-            ("bot_telegram_id", str(int(telegram_bot_id or 0))),
-            ("bot_id", str(int(telegram_bot_id or 0))),
-            ("username", str(bot_username or "").lstrip("@")),
-            ("bot_username", str(bot_username or "").lstrip("@")),
-            ("telegram_username", str(bot_username or "").lstrip("@")),
-        )
-        for column, value in candidates:
-            dtype = available.get(column)
-            if not dtype or not value or value == "0":
-                continue
-            if column in ("username", "bot_username", "telegram_username"):
-                if dtype not in ("text", "character varying", "character"):
-                    continue
-            elif dtype not in ("smallint", "integer", "bigint", "numeric", "text", "character varying", "character"):
-                continue
-            row = c.execute(
-                f'SELECT id::text AS id FROM bots WHERE "{column}"::text=? LIMIT 1',
-                (value,),
-            ).fetchone()
-            if row and row["id"]:
-                return str(row["id"])
-    except Exception as exc:
-        try:
-            c.rollback()
-        except Exception:
-            pass
-        log.warning("orders.bot_id uchun bots.id UUID topilmadi: %s", exc)
-    return None
-
-
 # ============================================================
 # CONFIRM ORDER
 # ============================================================
@@ -5018,11 +4965,9 @@ async def confirm(update, context):
 
     order_status = str(data.get("status", "processing") or "processing").lower()
     delivery_code = str(data.get("delivery_code") or "")
-    artifact_kind = str(data.get("artifact_kind") or "").lower()
     if order_provider == "yupay":
         if order_status in ("delivered", "success", "completed", "complete"):
-            needs_code = (str(product_row["provider_group"] or "") in ("robux", "gift_card") or artifact_kind == "voucher_code")
-            if needs_code and not delivery_code:
+            if str(product_row["provider_group"] or "") == "gift_card" and not delivery_code:
                 order_status = "processing"
             else:
                 order_status = "success"
@@ -5031,10 +4976,9 @@ async def confirm(update, context):
         c = conn()
         try:
             c.execute(
-                """INSERT INTO orders(bot_id,telegram_bot_id,service_code,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,cost_usd,charged_usd,sale_price,status,created_at,updated_at,notified,provider,provider_order_id,service_type)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (resolve_orders_bot_uuid(c, context.bot.id, getattr(context.bot, "username", "")), int(context.bot.id or 0),
-                 "roblox", uid, str(data.get("order_id") or merchant_order_id), int(game_id), int(paket_id),
+                """INSERT INTO orders(bot_id,user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,cost_usd,charged_usd,sale_price,status,created_at,updated_at,notified,provider,provider_order_id,service_type)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (int(context.bot.id or 0), uid, str(data.get("order_id") or merchant_order_id), int(game_id), int(paket_id),
                  str(context.user_data.get("offer_name") or "Roblox"), player_id,
                  json.dumps(fulfillment_data, ensure_ascii=False), float(product_row["price_usd"] or 0),
                  float(product_row["price_usd"] or 0), float(price), order_status,
@@ -5101,11 +5045,10 @@ async def confirm(update, context):
             f"✅ Roblox buyurtmangiz qabul qilindi!\n\n📦 {context.user_data.get('offer_name','Paket')}\n"
             f"💰 {price:,.0f} so'm\n🔢 Buyurtma raqami: {playpay_id}\n"
         )
-        if delivery_code and order_status == "success":
-            code_label = "🎮 Robux kodi" if str(product_row["provider_group"] or "") == "robux" else "🎁 Gift Card kodi"
-            result_text += f"\n{code_label}:\n<code>{html.escape(delivery_code)}</code>\n"
+        if delivery_code:
+            result_text += f"\n🎁 Gift Card kodi:\n<code>{html.escape(delivery_code)}</code>\n"
         else:
-            result_text += "\n⏳ Yetkazish jarayonda. Kod tayyor bo'lganda bot xabar beradi.\n"
+            result_text += "\n⏳ Yetkazish jarayonda. Tayyor bo'lganda bot xabar beradi.\n"
         await q.message.reply_text(result_text, parse_mode="HTML", reply_markup=main_menu())
     else:
         await q.message.reply_text(
@@ -7099,25 +7042,18 @@ async def admin_text_handler(update, context):
         keys = {"donat":"donat_markup_percent", "sim":"sim_markup_percent", "stars":"stars_markup_percent", "premium":"premium_markup_percent", "roblox":"roblox_markup_percent"}
         labels = {"donat":"🎮 Donat", "sim":"📱 SIM / Virtual raqam", "stars":"⭐ Stars", "premium":"💎 Premium", "roblox":"🎮 Roblox (Robux + Gift Card)"}
         set_setting(keys[kind], str(percent))
-        if kind == "roblox":
-            # Saqlangan Roblox Robux va Gift Card narxlarini ham darhol qayta hisoblaymiz.
-            c = conn()
-            rows = c.execute(
-                "SELECT paket_id, api_price_uzs FROM products WHERE game_id=? AND provider='yupay'",
-                (ROBLOX_GAME_ID,)
-            ).fetchall()
-            for row in rows:
-                base = Decimal(str(row["api_price_uzs"] or 0))
-                new_price = (base * (Decimal("1") + percent / Decimal("100"))).quantize(Decimal("1"))
-                c.execute(
-                    "UPDATE products SET sale_price=? WHERE game_id=? AND paket_id=? AND provider='yupay'",
-                    (float(new_price), ROBLOX_GAME_ID, row["paket_id"])
-                )
-            c.commit()
-            c.close()
+        updated_count = 0
+        if kind in ("donat", "stars", "premium", "roblox"):
+            # Saqlangan barcha paketlarning sotuv narxi darhol qayta hisoblanadi.
+            try:
+                updated_count = await asyncio.to_thread(recalc_product_prices)
+                await asyncio.to_thread(sync_all_child_catalogs)
+            except Exception:
+                log.exception("Ustama bo'yicha narxlarni yangilashda xatolik")
         context.user_data.clear()
         await update.message.reply_text(
-            f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%\n\n"
+            f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%\n"
+            f"🔄 {updated_count} ta paket narxi yangilandi.\n\n"
             "Bu xizmatning ustamasi boshqalardan alohida.",
             reply_markup=admin_kb(context)
         )
@@ -7766,10 +7702,7 @@ async def check_orders(context):
                     continue
                 order = data.get("order", {})
                 raw_status = str(order.get("status", r["status"]) or r["status"]).lower()
-                delivery_code = str(data.get("delivery_code") or "")
-                artifact_kind = str(data.get("artifact_kind") or "").lower()
-                needs_code = (str(r["service_type"] or "") in ("robux", "gift_card") or artifact_kind == "voucher_code")
-                new_status = "success" if _yupay_is_delivered(raw_status) and (not needs_code or bool(delivery_code)) else "processing"
+                new_status = "success" if raw_status == "delivered" and (str(r["service_type"] or "") != "gift_card" or bool(data.get("delivery_code"))) else "processing"
                 if raw_status == "failed":
                     try:
                         refunded = Decimal(str(order.get("refunded_usd") or "0"))
@@ -7788,22 +7721,17 @@ async def check_orders(context):
                         new_status = "processing"
                 old_status = str(r["status"] or "").lower()
                 if new_status != old_status:
-                    # Avval xaridorga xabar yuboramiz. Telegram yuborishda xato bo'lsa
-                    # status processing holatida qoladi va keyingi tekshiruv qayta urinadi.
+                    c = conn()
+                    c.execute("UPDATE orders SET status=?,updated_at=? WHERE id=?", (new_status, datetime.now().isoformat(), r["id"]))
+                    c.commit(); c.close()
                     if new_status == "success":
+                        code = str(data.get("delivery_code") or "")
                         msg = f"✅ Roblox buyurtma #{r['id']} yetkazildi."
-                        if delivery_code:
-                            code_label = "🎮 Robux kodi" if str(r["service_type"] or "") == "robux" else "🎁 Gift Card kodi"
-                            msg += f"\n\n{code_label}:\n<code>{html.escape(delivery_code)}</code>"
+                        if code:
+                            msg += f"\n\n🎁 Gift Card kodi:\n<code>{html.escape(code)}</code>"
                         await context.bot.send_message(r["user_id"], msg, parse_mode="HTML")
                     elif new_status == "failed":
                         await context.bot.send_message(r["user_id"], f"❌ Roblox buyurtma #{r['id']} bajarilmadi. To'lov balansingizga qaytarildi.")
-                    c = conn()
-                    try:
-                        c.execute("UPDATE orders SET status=?,updated_at=? WHERE id=?", (new_status, datetime.now().isoformat(), r["id"]))
-                        c.commit()
-                    finally:
-                        c.close()
                 continue
 
             status, data = await asyncio.to_thread(
@@ -8180,7 +8108,7 @@ async def admin_callback(update, context):
             sync_catalog
         )
         if ok:
-            sync_all_child_catalogs()
+            await asyncio.to_thread(sync_all_child_catalogs)
 
         await q.message.reply_text(
             f"{'✅' if ok else '❌'} {result}",
