@@ -2280,63 +2280,87 @@ def get_games_api():
     """Bay2Game /categories javobidagi barcha ichma-ich o'yinlarni yig'adi."""
     status, data = bay2game_request("/categories")
     if not data.get("ok"):
-        log.error("Bay2Game categories xatosi: %s", data.get("error", data))
+        log.error(
+            "Bay2Game categories xatosi: HTTP=%s keys=%s error=%s",
+            status, list(data.keys()), data.get("error") or data.get("message")
+        )
         return []
 
-    # API javobi ba'zan categories -> data -> games kabi bir necha
-    # qatlam bilan keladi. Birinchi listni qaytarish qolgan o'yinlarni yo'qotardi.
+    # Javob sxemasi o'zgarishi mumkin. Shu sababli faqat categories/games
+    # nomli kalitlarni emas, barcha ichma-ich dict/list qiymatlarini ko'ramiz.
     code_keys = (
         "game_code", "gameCode", "category_code", "categoryCode",
-        "game_id", "category_id", "code", "slug", "id",
+        "game_id", "gameId", "category_id", "categoryId",
+        "code", "slug", "id",
     )
     name_keys = (
-        "name", "game_name", "gameName", "category_name", "title", "slug",
+        "name", "game_name", "gameName", "category_name",
+        "categoryName", "title", "slug",
     )
     product_keys = {
-        "product_code", "productCode", "product_id", "sku",
-        "sell_price", "price_usd", "package_name",
+        "product_code", "productcode", "product_id", "productid",
+        "sku", "sell_price", "price_usd", "package_name",
     }
-    child_keys = (
-        "categories", "games", "items", "results", "data",
-        "children", "subcategories", "records", "list",
-    )
 
     found = []
     seen = set()
+    visited = set()
 
-    def walk(value, depth=0):
-        if depth > 8:
+    def walk(value, path="root", depth=0):
+        if depth > 12:
             return
         if isinstance(value, list):
-            for item in value:
-                walk(item, depth + 1)
+            for index, item in enumerate(value):
+                walk(item, f"{path}[{index}]", depth + 1)
             return
         if not isinstance(value, dict):
             return
 
-        # Mahsulot yozuvlarini o'yin deb qabul qilmaymiz.
-        keys_lower = {str(k).lower() for k in value.keys()}
+        # Bir xil obyekt turli wrapperlarda takrorlansa, qayta ishlamaymiz.
+        marker_obj = id(value)
+        if marker_obj in visited:
+            return
+        visited.add(marker_obj)
+
+        lower_keys = {str(k).lower() for k in value.keys()}
         code = next((value.get(k) for k in code_keys if value.get(k) not in (None, "")), None)
         name = next((value.get(k) for k in name_keys if value.get(k) not in (None, "")), None)
-        is_game = bool(code is not None and name is not None and not (keys_lower & product_keys))
-        if is_game:
-            marker = str(code).strip().lower()
-            if marker and marker not in seen:
-                seen.add(marker)
+        is_product = bool(lower_keys & product_keys)
+        if code is not None and name is not None and not is_product:
+            code_text = str(code).strip()
+            name_text = str(name).strip()
+            unique_key = code_text.lower()
+            if code_text and name_text and unique_key not in seen:
+                seen.add(unique_key)
                 found.append(value)
+                log.debug("Bay2Game game topildi: path=%s code=%s name=%s", path, code_text, name_text)
 
-        for key in child_keys:
-            child = value.get(key)
-            if isinstance(child, (list, dict)):
-                walk(child, depth + 1)
+        # API yangi wrapper kalit qo'shsa ham ichidagi ro'yxat yo'qolmasin.
+        for key, child in value.items():
+            if isinstance(child, (dict, list)):
+                walk(child, f"{path}.{key}", depth + 1)
 
     walk(data)
-
     if found:
-        log.info("Bay2Game katalogidan jami %s ta o'yin topildi", len(found))
+        log.info("Bay2Game katalogidan jami %s ta o'yin topildi (HTTP %s)", len(found), status)
         return found
 
-    log.error("Bay2Game katalog javobida o'yinlar ro'yxati topilmadi: keys=%s", list(data.keys()))
+    # Javob mazmunini maxfiy ma'lumotlarsiz log qilamiz; API key yozilmaydi.
+    def describe(value, depth=0):
+        if depth > 4:
+            return type(value).__name__
+        if isinstance(value, dict):
+            return {str(k): describe(v, depth + 1) for k, v in list(value.items())[:30]}
+        if isinstance(value, list):
+            return {"type": "list", "length": len(value), "first_item": describe(value[0], depth + 1) if value else None}
+        if isinstance(value, str):
+            return value[:100]
+        return value
+
+    log.error(
+        "Bay2Game /categories javobida o'yinlar topilmadi: HTTP=%s shape=%s",
+        status, describe(data)
+    )
     return []
 
 
@@ -3427,6 +3451,12 @@ def sync_catalog():
         except Exception:
             pass
 
+    if not categories:
+        return False, (
+            "⚠️ Mobile Legends Global'ning saqlangan 24 ta paketi saqlandi, "
+            "lekin Bay2Game /categories API o'yinlar ro'yxatini qaytarmadi. "
+            "Render logidagi 'Bay2Game /categories javobida o'yinlar topilmadi' qatorini yuboring."
+        )
     if game_count == 0:
         return False, "Katalogda saqlash mumkin bo'lgan o'yin topilmadi."
     return True, f"✅ Katalog yangilandi: {game_count} ta o'yin, {product_count} ta paket."
