@@ -2236,7 +2236,7 @@ def bay2game_request(path, params=None):
         response = requests.get(
             f"{BAY2GAME_BASE}/{path.lstrip('/')}",
             params=params,
-            timeout=35,
+            timeout=12,
         )
         try:
             data = response.json()
@@ -3267,53 +3267,8 @@ def sync_catalog():
     # Katalogni yangilash mavjud o'yinlarni o'chirib qo'ymasligi kerak.
     # API javobida vaqtincha ko'rinmay qolgan PUBG / Mobile Legends ham saqlanadi.
 
-    # PUBG umumiy katalog javobida tushib qolsa, API qidiruvi orqali ham izlaymiz.
-    pubg_in_catalog = any(
-        isinstance(item, dict) and "pubg" in str(
-            item.get("name") or item.get("game_name") or item.get("category_name") or item.get("title") or ""
-        ).lower()
-        for item in categories
-    )
-    # PUBG Global API katalogida alohida nom bilan bo'lsa, uni ham izlaymiz.
-    # API uni alohida qaytarmasa, oddiy PUBG mahsulotini Global deb taxmin qilmaymiz.
-    if not pubg_in_catalog or not any(
-        isinstance(item, dict) and "pubg" in str(
-            item.get("name") or item.get("game_name") or item.get("category_name") or item.get("title") or ""
-        ).lower() and "global" in str(
-            item.get("name") or item.get("game_name") or item.get("category_name") or item.get("title") or ""
-        ).lower()
-        for item in categories
-    ):
-        for search_term in ("pubg global", "pubg"):
-            # API logida /games 404 qaytargani uchun faqat mavjudligi tasdiqlangan
-            # /categories endpointidan foydalanamiz; noma'lum endpointni chaqirmaymiz.
-            st, response = bay2game_request("/categories", {"search": search_term, "q": search_term})
-            if st and response.get("ok"):
-                options = []
-                for key in ("categories", "games", "items", "results", "data"):
-                    val = response.get(key)
-                    if isinstance(val, list):
-                        options.extend(x for x in val if isinstance(x, dict))
-                    elif isinstance(val, dict):
-                        for inner in ("categories", "games", "items", "results", "data"):
-                            sub = val.get(inner)
-                            if isinstance(sub, list):
-                                options.extend(x for x in sub if isinstance(x, dict))
-                pubg_options = [
-                    x for x in options
-                    if "pubg" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()
-                    and "delay" not in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()
-                ]
-                if search_term == "pubg global":
-                    pubg_options = [x for x in pubg_options if "global" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()]
-                if pubg_options:
-                    categories.extend(pubg_options)
-                    break
-            if search_term == "pubg" and any(
-                "global" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()
-                for x in categories if isinstance(x, dict)
-            ):
-                break
+    # Katalog yangilanishini sekinlashtiradigan takroriy /categories?search
+    # so'rovlari olib tashlandi. PUBG Global faqat asosiy katalogda bo'lsa olinadi.
 
     for category in categories:
         if not isinstance(category, dict):
@@ -8115,21 +8070,26 @@ async def admin_callback(update, context):
     # ========================================================
 
     elif d == "a_sync":
-
-        await q.message.reply_text(
-            "🔄 Katalog yangilanmoqda..."
-        )
-
-        ok, result = await asyncio.to_thread(
-            sync_catalog
-        )
-        if ok:
-            sync_all_child_catalogs()
-
-        await q.message.reply_text(
-            f"{'✅' if ok else '❌'} {result}",
-            reply_markup=admin_kb(context)
-        )
+        progress = await q.message.reply_text("🔄 Katalog yangilanmoqda...\n⏳ API javobi kutilmoqda.")
+        try:
+            # API so'rovlari fon oqimida bajariladi; admin menyusi bloklanmaydi.
+            ok, result = await asyncio.wait_for(asyncio.to_thread(sync_catalog), timeout=240)
+            if ok:
+                await asyncio.to_thread(sync_all_child_catalogs)
+            final_text = f"{'✅' if ok else '❌'} {result}"
+        except asyncio.TimeoutError:
+            final_text = (
+                "⏱ Katalog yangilanishi 4 daqiqada tugamadi.\n"
+                "Saqlangan katalog o'zgartirilmagan bo'lishi mumkin. Render Logs'dagi "
+                "oxirgi Bay2Game API xatosini yuboring."
+            )
+        except Exception as exc:
+            log.exception("Admin katalog sync xatosi")
+            final_text = f"❌ Katalog yangilashda xato: {str(exc)[:300]}"
+        try:
+            await progress.edit_text(final_text, reply_markup=admin_kb(context))
+        except Exception:
+            await q.message.reply_text(final_text, reply_markup=admin_kb(context))
 
     elif d == "a_yupay_roblox_sync":
         await q.message.reply_text("🎮 Roblox katalogi yangilanmoqda...")
