@@ -635,7 +635,138 @@ def web_create_order(payload, user_id):
             "message": "Buyurtma qabul qilindi. Telegram xabaringizni tekshiring."}
 
 
+# ============================================================
+# XAVFSIZLIK: SKANER / EKSPLOIT URINISHLARINI BLOKLASH
+# ============================================================
+
+SEC_BLOCK_MIN = 10080  # 7 kun
+SEC_TRAPS = (
+    "/.env", "/.git", "/.aws", "/.ssh", "/.htaccess",
+    "/wp-admin", "/wp-login.php", "/wp-content", "/xmlrpc.php",
+    "/phpmyadmin", "/config.php", "/cgi-bin", "/actuator",
+    "/vendor/phpunit", "/server-status",
+)
+_sec_blocked = {}  # ip -> blok tugash vaqti (unix)
+_sec_lock = threading.Lock()
+
+
+def _sec_client_ip(handler):
+    # Render proksi orqasida: haqiqiy IP X-Forwarded-For ning birinchi qiymati.
+    xff = handler.headers.get("X-Forwarded-For", "")
+    ip = xff.split(",")[0].strip() if xff else ""
+    return ip or handler.client_address[0]
+
+
+def _sec_notify(ip, path):
+    if not BOT_TOKEN or not ADMIN_ID:
+        return
+
+    def _send():
+        text = (
+            "\U0001F6A8 XAVFSIZLIK OGOHLANTIRISHI (IP BLOKLANDI)\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001F310 IP: {ip}\n"
+            "\u26A0\uFE0F Sabab: Eksploit/skaner urinishi\n"
+            f"\U0001F517 Manzil: {path[:200]}\n"
+            f"\u23F1 Bloklash muddati: {SEC_BLOCK_MIN} daqiqa"
+        )
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": ADMIN_ID, "text": text},
+                timeout=5,
+            )
+        except Exception:
+            log.warning("Xavfsizlik xabari yuborilmadi")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def sec_init():
+    """Jadval yaratadi va muddati tugamagan bloklarni bazadan xotiraga yuklaydi."""
+    import time
+    try:
+        c = db_connect(MAIN_DB)
+        try:
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS blocked_ips("
+                "ip TEXT PRIMARY KEY, blocked_until INTEGER NOT NULL, "
+                "path TEXT DEFAULT '', created_at TEXT DEFAULT '')"
+            )
+            now = int(time.time())
+            c.execute("DELETE FROM blocked_ips WHERE blocked_until <= ?", (now,))
+            rows = c.execute("SELECT ip, blocked_until FROM blocked_ips").fetchall()
+            c.commit()
+        finally:
+            c.close()
+        with _sec_lock:
+            for r in rows:
+                _sec_blocked[r[0]] = float(r[1])
+        log.info("Bloklangan IP lar yuklandi: %s ta", len(rows))
+    except Exception:
+        log.exception("Bloklangan IP larni yuklashda xato")
+
+
+def _sec_save(ip, until, path):
+    def _run():
+        try:
+            c = db_connect(MAIN_DB)
+            try:
+                c.execute(
+                    "INSERT INTO blocked_ips(ip, blocked_until, path, created_at) "
+                    "VALUES(?,?,?,?) ON CONFLICT(ip) DO UPDATE SET "
+                    "blocked_until=excluded.blocked_until, path=excluded.path",
+                    (ip, int(until), path[:200], datetime.utcnow().isoformat()),
+                )
+                c.commit()
+            finally:
+                c.close()
+        except Exception:
+            log.exception("IP bloki bazaga yozilmadi")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _sec_check(handler):
+    """True qaytarsa - so'rov bloklanishi kerak."""
+    import time
+    from urllib.parse import urlparse
+
+    ip = _sec_client_ip(handler)
+    path = urlparse(handler.path).path
+    now = time.time()
+
+    with _sec_lock:
+        if len(_sec_blocked) > 5000:
+            for k in [k for k, v in _sec_blocked.items() if v <= now]:
+                _sec_blocked.pop(k, None)
+
+        if _sec_blocked.get(ip, 0) > now:
+            return True
+
+        if path.lower().startswith(SEC_TRAPS):
+            _sec_blocked[ip] = now + SEC_BLOCK_MIN * 60
+            log.warning("IP bloklandi: %s | %s", ip, path[:200])
+            _sec_save(ip, _sec_blocked[ip], path)
+            _sec_notify(ip, path)
+            return True
+
+    return False
+
+
 class WebAPIHandler(BaseHTTPRequestHandler):
+
+    def parse_request(self):
+        # Barcha metodlar (GET/POST/HEAD/OPTIONS) uchun bitta tekshiruv nuqtasi.
+        if not super().parse_request():
+            return False
+        if _sec_check(self):
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return False
+        return True
 
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -3783,32 +3914,6 @@ async def user_is_subscribed(bot, user_id):
         return False
 
 
-async def process_pending_referral(context, user, payload=None):
-    """Referalni hisoblaydi (faqat asosiy botda, faqat birinchi marta kirganda)."""
-    is_main_bot = int(getattr(context.bot, "id", 0) or 0) == int(MAIN_BOT_ID or 0)
-    if not is_main_bot or not user:
-        return None
-    payload = payload or context.user_data.pop("pending_ref", None)
-    is_new = mark_main_bot_user(user.id)
-    ensure_user(user)
-    if not (is_new and payload and str(payload).startswith("ref_")):
-        return None
-    context.user_data.pop("pending_ref", None)
-    result = register_referral(user.id, payload)
-    if result:
-        try:
-            await context.bot.send_message(
-                chat_id=result["referrer_id"],
-                text=(
-                    "🎉 Referalingiz botga qo'shildi!\n"
-                    f"💰 Bonus: {result['bonus']:,.0f} so'm balansingizga qo'shildi."
-                ),
-            )
-        except Exception:
-            pass
-    return result
-
-
 async def subscription_check_callback(update, context):
     q = update.callback_query
     if not q:
@@ -3818,11 +3923,6 @@ async def subscription_check_callback(update, context):
     except Exception:
         pass
     if await user_is_subscribed(context.bot, q.from_user.id):
-        # Obunadan oldin saqlab qo'yilgan referalni shu yerda hisoblaymiz.
-        try:
-            await process_pending_referral(context, q.from_user)
-        except Exception:
-            log.exception("Obunadan keyin referalni hisoblashda xato")
         await _b2tg_edit_or_replace(q, "✅ Obuna tasdiqlandi! Endi botdan foydalanishingiz mumkin.", reply_markup=main_menu(), parse_mode=None)
     else:
         try:
@@ -3844,8 +3944,6 @@ async def subscription_check_callback(update, context):
 async def start(update, context):
 
     set_request_db(context)
-    if context.args and str(context.args[0]).startswith("ref_"):
-        context.user_data["pending_ref"] = context.args[0]
     if update.effective_user and not await user_is_subscribed(context.bot, update.effective_user.id):
         if update.message:
             await update.message.reply_text(
@@ -3856,14 +3954,29 @@ async def start(update, context):
     if not await child_platform_access(update, context):
         return
     is_main_bot = int(getattr(context.bot, "id", 0) or 0) == int(MAIN_BOT_ID or 0)
-    if is_main_bot:
-        await process_pending_referral(
-            context,
-            update.effective_user,
-            context.args[0] if context.args else None,
-        )
-    else:
-        ensure_user(update.effective_user)
+    is_new_main_user = mark_main_bot_user(update.effective_user.id) if is_main_bot else False
+    ensure_user(update.effective_user)
+
+    # Referal faqat asosiy DONUZ botini birinchi marta ochgan yangi foydalanuvchi uchun hisoblanadi.
+    referral_result = None
+    if (
+        is_new_main_user
+        and update.message
+        and context.args
+        and context.args[0].startswith("ref_")
+    ):
+        referral_result = register_referral(update.effective_user.id, context.args[0])
+        if referral_result:
+            try:
+                await context.bot.send_message(
+                    chat_id=referral_result["referrer_id"],
+                    text=(
+                        "🎉 Referalingiz botga qo'shildi!\n"
+                        f"💰 Bonus: {referral_result['bonus']:,.0f} so'm balansingizga qo'shildi."
+                    ),
+                )
+            except Exception:
+                pass
 
     if not update.message:
         return
@@ -8493,6 +8606,7 @@ def main():
     CURRENT_DB.set(MAIN_DB)
     init_db()
     ensure_external_schema()
+    sec_init()
 
     ensure_pubg()
     ensure_mobile_legends()
