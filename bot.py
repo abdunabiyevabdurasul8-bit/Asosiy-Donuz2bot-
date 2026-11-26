@@ -1645,7 +1645,8 @@ async def manage_child_bots(context):
 
 
 def build_application(token, child=False):
-    app = Application.builder().token(token).build()
+    # concurrent_updates: uzoq handler (katalog sync, ID tekshirish) boshqa foydalanuvchilarni kutdirmasin.
+    app = Application.builder().token(token).concurrent_updates(True).build()
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
@@ -1655,7 +1656,7 @@ def build_application(token, child=False):
     app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.VIDEO, media_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     if app.job_queue:
-        app.job_queue.run_repeating(check_orders, interval=30, first=30)
+        app.job_queue.run_repeating(check_orders, interval=15, first=10)
         if not child:
             app.job_queue.run_repeating(manage_child_bots, interval=60, first=5)
     return app
@@ -2544,9 +2545,30 @@ def get_packages_api(game_id):
     if not game_code:
         game_code = str(game_id)
 
-    status, data = bay2game_request("/products", {"game_code": game_code})
+    candidates = [game_code]
+    low = game_code.lower()
+    # Bay2Game'da Free Fire'ning haqiqiy kodi: freefire_global (16 ta paket).
+    if "freefire" in low.replace("_", "").replace("-", "") and low != "freefire_global":
+        candidates = ["freefire_global", game_code]
+    if low.endswith("_id") and len(low) > 3:
+        candidates.append(game_code[:-3])
+    if "freefire" in low.replace("_", "").replace("-", "") or "free fire" in str(row["name"] if row else "").lower():
+        candidates += ["freefire_global", "FREEFIRE_GLOBAL", "FreeFire_Global", "freefire", "FREEFIRE", "free_fire"]
+    seen_codes_try = set()
+    status, data = 0, {"ok": False}
+    for cand in candidates:
+        if cand in seen_codes_try:
+            continue
+        seen_codes_try.add(cand)
+        status, data = bay2game_request("/products", {"game_code": cand})
+        if data.get("ok"):
+            if cand != game_code:
+                log.info("Bay2Game products zaxira kod bilan topildi: %s -> %s", game_code, cand)
+                game_code = cand
+            break
     if not data.get("ok"):
-        log.error("Bay2Game products xatosi game_code=%s: %s", game_code, data.get("error", data))
+        log.warning("Bay2Game products olinmadi game_code=%s (sinalgan: %s): %s",
+                    game_code, ", ".join(candidates), data.get("error", data))
         return None
 
     # API turli javob formatlaridan foydalanishi mumkin:
@@ -3143,6 +3165,63 @@ def calc_sale_price(api_uzs):
     )
 
 
+def recalc_donat_prices(percent):
+    """Donat ustamasi o'zgarganda saqlangan paketlar narxini darhol yangilaydi.
+
+    Faqat oddiy donat (Bay2Game o'yinlari) qayta hisoblanadi: Premium, Stars,
+    Roblox (YuPay) va Grand Mobile narxlariga tegilmaydi.
+    """
+    percent = Decimal(str(percent))
+    now = datetime.now().isoformat()
+    updated = []
+    c = conn()
+    try:
+        rows = c.execute(
+            "SELECT game_id,paket_id,game_name,package_name,api_price_uzs,provider,provider_product_code "
+            "FROM products"
+        ).fetchall()
+        for row in rows:
+            if str(row["provider"] or "bay2game").lower() == "yupay":
+                continue
+            if int(row["game_id"]) == int(GRAND_MOBILE_GAME_ID):
+                continue
+            words = (str(row["game_name"] or "") + " " + str(row["package_name"] or "")).lower()
+            if "premium" in words or "star" in words:
+                continue
+            if telegram_stars_amount(row["provider_product_code"], row["package_name"]):
+                continue
+            base = Decimal(str(row["api_price_uzs"] or 0))
+            if base <= 0:
+                continue
+            new_price = (base * (Decimal("1") + percent / Decimal("100"))).quantize(Decimal("1"))
+            c.execute(
+                "UPDATE products SET sale_price=?,updated_at=? WHERE game_id=? AND paket_id=?",
+                (float(new_price), now, row["game_id"], row["paket_id"]),
+            )
+            updated.append((row["game_id"], row["paket_id"], new_price))
+        c.commit()
+    finally:
+        c.close()
+    # Mijoz botlari katalogiga ham yangi narxni yuboramiz.
+    try:
+        mc = main_conn()
+        child_dbs = [r["db_path"] for r in mc.execute("SELECT db_path FROM child_bots").fetchall()]
+        mc.close()
+        for db in child_dbs:
+            try:
+                cc = sqlite3.connect(db, timeout=30)
+                cc.executemany(
+                    "UPDATE products SET sale_price=?,updated_at=? WHERE game_id=? AND paket_id=?",
+                    [(float(pr), now, g, k) for g, k, pr in updated],
+                )
+                cc.commit(); cc.close()
+            except Exception:
+                log.exception("Child katalog donat narxini yangilash xatosi")
+    except Exception:
+        log.exception("Child botlar ro'yxatini olishda xato")
+    return len(updated)
+
+
 # ============================================================
 # GAME SAQLASH
 # ============================================================
@@ -3424,6 +3503,9 @@ def sync_catalog():
                 name = f"{name} Global"
         if not game_code:
             continue
+        if "free" in name.lower() or "freefire" in game_code.lower().replace("_", ""):
+            # Free Fire uchun API qaytargan haqiqiy kodlarni logga chiqaramiz.
+            log.info("FREEFIRE CATEGORY: name=%s game_code=%s raw=%s", name, game_code, json.dumps(category, ensure_ascii=False)[:500])
         gid = bay2game_game_internal_id(game_code, name)
         fields = category.get("game_fields") or category.get("gameFields") or category.get("fields") or category.get("required_fields") or category.get("input_fields") or []
         names = _field_names(fields)
@@ -7137,6 +7219,10 @@ async def admin_text_handler(update, context):
         keys = {"donat":"donat_markup_percent", "sim":"sim_markup_percent", "stars":"stars_markup_percent", "premium":"premium_markup_percent", "roblox":"roblox_markup_percent"}
         labels = {"donat":"🎮 Donat", "sim":"📱 SIM / Virtual raqam", "stars":"⭐ Stars", "premium":"💎 Premium", "roblox":"🎮 Roblox (Robux + Gift Card)"}
         set_setting(keys[kind], str(percent))
+        donat_changed = 0
+        if kind == "donat":
+            # Ustama qo'yilishi bilan mavjud donat paketlari yangi narxda ko'rinsin.
+            donat_changed = await asyncio.to_thread(recalc_donat_prices, percent)
         if kind == "roblox":
             # Saqlangan Roblox Robux va Gift Card narxlarini ham darhol qayta hisoblaymiz.
             c = conn()
@@ -7155,8 +7241,9 @@ async def admin_text_handler(update, context):
             c.close()
         context.user_data.clear()
         await update.message.reply_text(
-            f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%\n\n"
-            "Bu xizmatning ustamasi boshqalardan alohida.",
+            f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%\n"
+            + (f"📦 {donat_changed} ta paket narxi yangilandi.\n" if kind == "donat" else "")
+            + "\nBu xizmatning ustamasi boshqalardan alohida.",
             reply_markup=admin_kb(context)
         )
         return True
